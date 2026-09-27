@@ -1,4 +1,12 @@
 import type { RecordedGPSPoint } from '../services/api/trackingService';
+import type { AIModelStatus } from '../services/AIErrorCorrectionService';
+import type { FusedState } from '../services/ekf/FusionRuntime';
+
+/** Reflects whether AI dead-reckoning correction is correcting, falling back, or absent. */
+export type AICorrectionStatus = 'active' | 'fallback' | 'unavailable';
+
+/** Re-export for consumers that need it from the types module only. */
+export type { AIModelStatus, FusedState };
 
 export type OperationalMatrixScenario =
   | 'scenario1' // [GPS ON + Net ON] — Standard Online Navigation
@@ -151,6 +159,9 @@ export interface TelemetryData {
   ax: number;
   ay: number;
   az: number;
+  gx: number;
+  gy: number;
+  gz: number;
   pitch: number;
   roll: number;
   yaw: number;
@@ -158,6 +169,12 @@ export interface TelemetryData {
   isStreamingMotion: boolean;
   isStreamingOrientation: boolean;
   lastEventTimestamp: number | null;
+  /** AI-corrected INS velocity X (m/s ENU). Null when AI is in fallback mode. */
+  aiCorrectedVelX: number | null;
+  /** AI-corrected INS velocity Y (m/s ENU). Null when AI is in fallback mode. */
+  aiCorrectedVelY: number | null;
+  /** AI confidence proxy [0..1]. Null when AI is in fallback mode. */
+  aiConfidence: number | null;
 }
 
 export interface SettingsState {
@@ -230,12 +247,21 @@ export interface NavigationContextType {
   cachedTilesCount: number;
   sensorEventsStream: SensorEventLogEntry[];
   trackingSession: ActiveTrackingSession;
+  /** Whether AI velocity correction is active, running in fallback, or unavailable. */
+  aiCorrectionStatus: AICorrectionStatus;
+  /** Real-time 15-state EKF sensor-fused state (lat, lon, velocity, heading, sourceMode, biases, stabilization). */
+  fusedState: FusedState | null;
+  /** Real-time status of backend API connection ('connected' | 'offline' | 'error'). */
+  backendConnectionStatus: 'connected' | 'offline' | 'error';
 
   // Actions
   toggleSensors: (enabled?: boolean) => Promise<boolean>;
   setSystemMode: (mode: SystemDataMode) => void;
   refreshGpsLocation: () => Promise<CurrentLocationData | null>;
   setMatrixScenario: (scenario: OperationalMatrixScenario) => void;
+  /** Update AI correction status from the DR ticker after each inference attempt. */
+  setAiCorrectionStatus: (status: AICorrectionStatus) => void;
+
   calibrateCompass: () => Promise<void>;
   grantGnssPermission: () => Promise<void>;
   grantAllSensors: () => Promise<void>;

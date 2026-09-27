@@ -7,7 +7,7 @@ export const API_CONFIG = {
   // Configurable base URL for future backend integration (supports Vite env)
   BASE_URL:
     (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL) ||
-    'https://api.reckonx-navigation.local/v1',
+    'http://localhost:3001/api',
   TIMEOUT_MS: 10000,
   ENDPOINTS: {
     AUTH_LOGIN: '/auth/login',

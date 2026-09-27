@@ -5,7 +5,7 @@ import { MapView } from '../components/MapView';
 import { useNavigationContext } from '../context/NavigationContext';
 import { Download, AlertCircle } from 'lucide-react';
 import { MobileShell } from '../components/MobileShell';
-import { DeadReckoningEngine } from '../services/deadReckoningEngine';
+import { haversineDistance } from '../services/ekf/OutputStabilizer';
 import { formatKmDistance } from '../utils/distanceFormatter';
 
 export const SummaryPage: React.FC = () => {
@@ -42,7 +42,7 @@ export const SummaryPage: React.FC = () => {
     for (let i = 1; i < points.length; i++) {
       const p1: [number, number] = [points[i - 1].lat, points[i - 1].lng];
       const p2: [number, number] = [points[i].lat, points[i].lng];
-      calculatedDistanceKm += DeadReckoningEngine.calculateHaversineDistance(p1, p2);
+      calculatedDistanceKm += haversineDistance(p1[0], p1[1], p2[0], p2[1]) / 1000.0;
     }
   }
 

@@ -1,0 +1,58 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Session {
+  id               String           @id @default(uuid())
+  startTime        Float
+  endTime          Float?
+  originAddress    String
+  destAddress      String
+  startLat         Float
+  startLng         Float
+  destLat          Float
+  destLng          Float
+  totalDistanceKm  Float
+  durationSeconds  Float
+  gnssPointsCount  Int
+  drPointsCount    Int
+  createdAt        DateTime         @default(now())
+  points           TelemetryPoint[]
+}
+
+model TelemetryPoint {
+  id                String   @id @default(uuid())
+  sessionId         String?
+  session           Session? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  timestamp         Float
+  lat               Float
+  lng               Float
+  accuracyMeters    Float?
+  speedKmH          Float?
+  headingDeg        Float?
+  altitudeMeters    Float?
+  isDeadReckoning   Boolean  @default(false)
+  rawInsVelX        Float?
+  rawInsVelY        Float?
+  aiCorrectedVelX   Float?
+  aiCorrectedVelY   Float?
+  aiConfidence      Float?
+  gpsGroundTruthLat Float?
+  gpsGroundTruthLng Float?
+  createdAt         DateTime @default(now())
+}
+
+model RouteCache {
+  id          String   @id @default(uuid())
+  profile     String
+  coordinates String
+  routeData   String
+  createdAt   DateTime @default(now())
+
+  @@unique([profile, coordinates])
+}

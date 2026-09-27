@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ReckonX Test Suite Report</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0F172A; color: #F8FAFC; margin: 0; padding: 40px 20px; }
+    .container { max-width: 960px; margin: 0 auto; background: #1E293B; border: 1px solid #334155; border-radius: 12px; padding: 32px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+    h1 { margin-top: 0; font-size: 24px; color: #38BDF8; }
+    .badge { display: inline-block; padding: 6px 14px; border-radius: 9999px; font-weight: bold; font-size: 13px; text-transform: uppercase; }
+    .badge-pass { background: #065F46; color: #34D399; border: 1px solid #059669; }
+    .badge-fail { background: #7F1D1D; color: #F87171; border: 1px solid #DC2626; }
+    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 24px 0; }
+    .stat-card { background: #0F172A; border: 1px solid #334155; border-radius: 8px; padding: 16px; text-align: center; }
+    .stat-val { font-size: 28px; font-weight: bold; color: #F1F5F9; }
+    .stat-lbl { font-size: 12px; color: #94A3B8; text-transform: uppercase; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+    th, td { padding: 14px 16px; text-align: left; border-bottom: 1px solid #334155; font-size: 14px; }
+    th { background: #0F172A; color: #94A3B8; font-weight: 600; text-transform: uppercase; font-size: 11px; }
+    tr:hover { background: #334155; }
+    pre { background: #090D16; border: 1px solid #1E293B; border-radius: 6px; padding: 12px; font-size: 12px; color: #CBD5E1; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <h1>ReckonX Test Suite Report</h1>
+      <span class="badge badge-pass">
+        ALL TESTS PASSED
+      </span>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-val">4</div><div class="stat-lbl">Suites Run</div></div>
+      <div class="stat-card"><div class="stat-val" style="color: #34D399;">4</div><div class="stat-lbl">Passed</div></div>
+      <div class="stat-card"><div class="stat-val" style="color: #F87171;">0</div><div class="stat-lbl">Failed</div></div>
+      <div class="stat-card"><div class="stat-val">2.73s</div><div class="stat-lbl">Total Runtime</div></div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Test Suite</th>
+          <th>Level / Category</th>
+          <th>Status</th>
+          <th>Duration</th>
+        </tr>
+      </thead>
+      <tbody>
+        
+        <tr>
+          <td><strong>Python DeadReckon AI Core (15-State EKF, HMM, INS, Seamless Controller)</strong></td>
+          <td>Unit Tests</td>
+          <td><span class="badge badge-pass" style="padding: 3px 8px; font-size: 11px;">PASS</span></td>
+          <td>0.666s</td>
+        </tr>
+        
+        <tr>
+          <td><strong>Frontend TypeScript Core (EkfCore, InsMechanization LPF, Distance & Route Utils)</strong></td>
+          <td>Unit Tests</td>
+          <td><span class="badge badge-pass" style="padding: 3px 8px; font-size: 11px;">PASS</span></td>
+          <td>0.575s</td>
+        </tr>
+        
+        <tr>
+          <td><strong>Fastify REST API & Database (Sessions CRUD, Batch Telemetry, Route Fallbacks)</strong></td>
+          <td>Integration Tests</td>
+          <td><span class="badge badge-pass" style="padding: 3px 8px; font-size: 11px;">PASS</span></td>
+          <td>0.82s</td>
+        </tr>
+        
+        <tr>
+          <td><strong>Full Mission End-to-End Pipeline (Sensor -> INS -> AI -> 15-State EKF -> HMM Map Matching)</strong></td>
+          <td>End-to-End Tests</td>
+          <td><span class="badge badge-pass" style="padding: 3px 8px; font-size: 11px;">PASS</span></td>
+          <td>0.673s</td>
+        </tr>
+        
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

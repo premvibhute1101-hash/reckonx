@@ -1,0 +1,44 @@
+{
+  "timestamp": "2026-09-23T23:01:18.044724",
+  "summary": {
+    "total_suites": 4,
+    "passed": 4,
+    "failed": 0,
+    "duration_s": 2.734,
+    "status": "PASSED"
+  },
+  "suites": [
+    {
+      "name": "Python DeadReckon AI Core (15-State EKF, HMM, INS, Seamless Controller)",
+      "category": "Unit Tests",
+      "passed": true,
+      "duration_s": 0.666,
+      "output": "............\n----------------------------------------------------------------------\nRan 12 tests in 0.002s\n\nOK",
+      "returncode": 0
+    },
+    {
+      "name": "Frontend TypeScript Core (EkfCore, InsMechanization LPF, Distance & Route Utils)",
+      "category": "Unit Tests",
+      "passed": true,
+      "duration_s": 0.575,
+      "output": "================================================================================\n  FRONTEND & TYPESCRIPT CORE UNIT TESTS\n================================================================================\n  [PASS] DistanceFormatter: formats kilometers accurately\n  [PASS] DistanceFormatter: formats imperial miles accurately\n  [PASS] RouteProgress: calculates accurate remaining road distance along polyline\n  [PASS] RouteProgress: detects off-route distance when far from path\n  [PASS] InsMechanization: attitude initialization from gravity vector\n  [PASS] InsMechanization: 2nd-order Butterworth LPF attenuates high-frequency noise\n  [PASS] GnssQualityStateMachine: updates trust factors and inflation correctly\n  [PASS] OutputStabilizer: clamps unphysical position jumps exceeding max speed\n--------------------------------------------------------------------------------\nFrontend Unit Tests: 8/8 Passed",
+      "returncode": 0
+    },
+    {
+      "name": "Fastify REST API & Database (Sessions CRUD, Batch Telemetry, Route Fallbacks)",
+      "category": "Integration Tests",
+      "passed": true,
+      "duration_s": 0.82,
+      "output": "================================================================================\n  BACKEND FASTIFY REST API INTEGRATION TESTS (In-Memory HTTP Injection)\n================================================================================\n  [PASS] Backend API: GET /api/health returns 200 OK\n  [PASS] Backend API: POST /api/sessions creates/updates a navigation session\n  [PASS] Backend API: GET /api/sessions lists stored sessions\n  [PASS] Backend API: GET /api/sessions/:id retrieves session details\n  [PASS] Backend API: POST /api/telemetry persists sensor point batches\n  [PASS] Backend API: POST /api/sessions rejects invalid payload with 400\n  [PASS] Backend API: POST /api/telemetry rejects empty points with 400\n  [PASS] Backend API: GET /api/sessions/:id returns 404 for non-existent session\n--------------------------------------------------------------------------------\nBackend Integration Tests: 8/8 Passed",
+      "returncode": 0
+    },
+    {
+      "name": "Full Mission End-to-End Pipeline (Sensor -> INS -> AI -> 15-State EKF -> HMM Map Matching)",
+      "category": "End-to-End Tests",
+      "passed": true,
+      "duration_s": 0.673,
+      "output": ".\n----------------------------------------------------------------------\nRan 1 test in 0.014s\n\nOK",
+      "returncode": 0
+    }
+  ]
+}

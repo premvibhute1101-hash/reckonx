@@ -11,7 +11,22 @@ export interface RecordedGPSPoint {
   headingDeg?: number;
   altitudeMeters?: number | null;
   isDeadReckoning?: boolean;
+  /** Raw INS velocity X before AI correction (m/s ENU). Populated during DR epochs. */
+  rawInsVelX?: number;
+  /** Raw INS velocity Y before AI correction (m/s ENU). Populated during DR epochs. */
+  rawInsVelY?: number;
+  /** AI-corrected velocity X (m/s ENU). Null when AI is in fallback mode. */
+  aiCorrectedVelX?: number | null;
+  /** AI-corrected velocity Y (m/s ENU). Null when AI is in fallback mode. */
+  aiCorrectedVelY?: number | null;
+  /** AI confidence proxy [0..1]. Null when AI is in fallback mode. */
+  aiConfidence?: number | null;
+  /** GPS ground-truth lat at this point (same as lat for GNSS points). */
+  gpsGroundTruthLat?: number;
+  /** GPS ground-truth lng at this point (same as lng for GNSS points). */
+  gpsGroundTruthLng?: number;
 }
+
 
 export interface TrackingSessionPayload {
   sessionId: string;

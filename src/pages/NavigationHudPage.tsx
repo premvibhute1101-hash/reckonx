@@ -20,13 +20,54 @@ import {
   Maximize2,
   Plus,
   Minus,
+  Brain,
+  Server,
+  Smartphone,
+  Activity,
 } from 'lucide-react';
 import { MobileShell } from '../components/MobileShell';
+import { MobileTestGuideModal } from '../components/MobileTestGuideModal';
+import { haversineDistance } from '../services/ekf/OutputStabilizer';
 import { DeadReckoningEngine } from '../services/deadReckoningEngine';
 import { OrientationService } from '../services/OrientationService';
+import { AIErrorCorrectionService } from '../services/AIErrorCorrectionService';
 import { formatKmDistance } from '../utils/distanceFormatter';
 import { calculateRemainingRoadDistance } from '../utils/routeProgress';
 import type { OperationalMatrixScenario } from '../types/navigation';
+
+export const getGnssStatusBadge = (
+  fused: { sourceMode: string; gnssState: string } | null | undefined,
+  isGnssActive: boolean
+) => {
+  const sourceMode = fused ? fused.sourceMode : (isGnssActive ? 'GNSS' : 'IDR');
+  const gnssState = fused ? fused.gnssState : (isGnssActive ? 'GOOD' : 'WEAK_LOST');
+
+  if (sourceMode === 'GNSS' && gnssState === 'GOOD') {
+    return {
+      label: 'GNSS · Good',
+      dotColor: 'bg-emerald-500',
+      badgeBg: 'bg-emerald-50/95 text-emerald-800 border-emerald-300',
+      bottomBadgeBg: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      title: 'GNSS Active · High Precision Fix (<10m)',
+    };
+  } else if (sourceMode === 'GNSS' && gnssState === 'DEGRADED') {
+    return {
+      label: 'GNSS · Degraded',
+      dotColor: 'bg-amber-500',
+      badgeBg: 'bg-amber-50/95 text-amber-800 border-amber-300',
+      bottomBadgeBg: 'bg-amber-50 text-amber-700 border-amber-200',
+      title: 'GNSS Active · Degraded Precision (10-200m)',
+    };
+  } else {
+    return {
+      label: 'IDR · Weak Signal',
+      dotColor: 'bg-rose-500 animate-pulse',
+      badgeBg: 'bg-rose-50/95 text-rose-800 border-rose-300',
+      bottomBadgeBg: 'bg-rose-50 text-rose-700 border-rose-200',
+      title: 'Dead Reckoning Active · GNSS Signal Lost / Weak',
+    };
+  }
+};
 
 const LiveMetricsOverlay: React.FC<{
   remainingKm: number;
@@ -45,188 +86,292 @@ const LiveMetricsOverlay: React.FC<{
   onToggleCameraMode,
   onEndNavigation,
 }) => {
-  const { settings, telemetry, sensorStatus, isOnline, matrixScenario, cachedTilesCount } = useNavigationContext();
-  const [showExitModal, setShowExitModal] = useState(false);
+    const { settings, telemetry, sensorStatus, isOnline, matrixScenario, cachedTilesCount, aiCorrectionStatus, backendConnectionStatus, fusedState, currentLocation } = useNavigationContext();
+    const [showExitModal, setShowExitModal] = useState(false);
+    const [showMobileGuide, setShowMobileGuide] = useState(false);
 
-  const isHeadingValid = isGnssActive || sensorStatus.compass || liveHeading > 0;
-  const formattedHeading = OrientationService.formatCardinalHeading(liveHeading, isHeadingValid);
+    const isHeadingValid = isGnssActive || sensorStatus.compass || liveHeading > 0;
+    const formattedHeading = OrientationService.formatCardinalHeading(liveHeading, isHeadingValid);
+    const gnssBadge = getGnssStatusBadge(fusedState, isGnssActive);
 
-  const scenarioBadges: Record<
-    OperationalMatrixScenario,
-    { label: string; bg: string; border: string; text: string }
-  > = {
-    scenario1: {
-      label: 'Scenario 1: [GPS ON + Net ON] Online Nav',
-      bg: 'bg-emerald-50',
-      border: 'border-emerald-600/40',
-      text: 'text-emerald-800',
-    },
-    scenario2: {
-      label: 'Scenario 2: [GPS OFF + Net ON] Tunnel DR Mode',
-      bg: 'bg-amber-50',
-      border: 'border-amber-600/40',
-      text: 'text-amber-800',
-    },
-    scenario3: {
-      label: 'Scenario 3: [GPS ON + Net OFF] Offline Satellite',
-      bg: 'bg-blue-50',
-      border: 'border-blue-600/40',
-      text: 'text-blue-800',
-    },
-    scenario4: {
-      label: 'Scenario 4: [GPS OFF + Net OFF] Pure Offline DR',
-      bg: 'bg-purple-50',
-      border: 'border-purple-600/40',
-      text: 'text-purple-800',
-    },
-  };
+    const scenarioBadges: Record<
+      OperationalMatrixScenario,
+      { label: string; bg: string; border: string; text: string }
+    > = {
+      scenario1: {
+        label: 'Scenario 1: [GPS ON + Net ON] Online Nav',
+        bg: 'bg-emerald-50',
+        border: 'border-emerald-600/40',
+        text: 'text-emerald-800',
+      },
+      scenario2: {
+        label: 'Scenario 2: [GPS OFF + Net ON] Tunnel DR Mode',
+        bg: 'bg-amber-50',
+        border: 'border-amber-600/40',
+        text: 'text-amber-800',
+      },
+      scenario3: {
+        label: 'Scenario 3: [GPS ON + Net OFF] Offline Satellite',
+        bg: 'bg-blue-50',
+        border: 'border-blue-600/40',
+        text: 'text-blue-800',
+      },
+      scenario4: {
+        label: 'Scenario 4: [GPS OFF + Net OFF] Pure Offline DR',
+        bg: 'bg-purple-50',
+        border: 'border-purple-600/40',
+        text: 'text-purple-800',
+      },
+    };
 
-  const currentBadge = scenarioBadges[matrixScenario];
+    const currentBadge = scenarioBadges[matrixScenario];
 
-  return (
-    <>
-      {/* 4/4 Operational Matrix Status Bar (Automatically detected from real hardware & network) */}
-      <div
-        className={`w-full ${currentBadge.bg} border-b ${currentBadge.border} px-3 py-1.5 flex items-center justify-between z-20 relative`}
-      >
-        <div className={`flex items-center gap-1.5 text-xs font-bold ${currentBadge.text} truncate`}>
-          <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span className="truncate">
-            {currentBadge.label} {drDrift > 0 ? `(±${drDrift.toFixed(1)}m drift)` : ''}
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
-          {/* Tile Cache Badge */}
-          <div
-            className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-slate-900 text-white font-mono"
-            title="Cached Leaflet Tiles in IndexedDB"
-          >
-            <Database className="w-3 h-3 text-emerald-400" />
-            <span>{cachedTilesCount} Tiles</span>
+    return (
+      <>
+        {/* 4/4 Operational Matrix Status Bar (Automatically detected from real hardware & network) */}
+        <div
+          className={`w-full ${currentBadge.bg} border-b ${currentBadge.border} px-3 py-1.5 flex items-center justify-between z-20 relative`}
+        >
+          <div className={`flex items-center gap-1.5 text-xs font-bold ${currentBadge.text} truncate`}>
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+            <span className="truncate">
+              {currentBadge.label} {drDrift > 0 ? `(±${drDrift.toFixed(1)}m drift)` : ''}
+            </span>
           </div>
 
-          {/* Real GNSS / DR Indicator */}
-          <div
-            className={`text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1 font-mono border ${
-              isGnssActive
+          <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
+            {/* Backend Connection Status Badge */}
+            <div
+              className={`text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1 font-mono border ${
+                backendConnectionStatus === 'connected'
+                  ? 'bg-emerald-700 text-white border-emerald-800'
+                  : backendConnectionStatus === 'error'
+                  ? 'bg-amber-600 text-white border-amber-700'
+                  : 'bg-slate-700 text-slate-300 border-slate-800'
+              }`}
+              title={
+                backendConnectionStatus === 'connected'
+                  ? 'Backend Service API Connected (Local Sync Active)'
+                  : backendConnectionStatus === 'error'
+                  ? 'Backend API Error (Fallback Local Mode)'
+                  : 'Backend Service Offline (Local-Only Edge Mode)'
+              }
+            >
+              <Server className="w-3 h-3" />
+              <span>
+                {backendConnectionStatus === 'connected'
+                  ? 'API Sync'
+                  : backendConnectionStatus === 'error'
+                  ? 'API Error'
+                  : 'Local Only'}
+              </span>
+            </div>
+
+            {/* Tile Cache Badge */}
+            <div
+              className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-slate-900 text-white font-mono"
+              title="Cached Leaflet Tiles in IndexedDB"
+            >
+              <Database className="w-3 h-3 text-emerald-400" />
+              <span>{cachedTilesCount} Tiles</span>
+            </div>
+
+            {/* AI Correction Status Badge */}
+            <div
+              className={`text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1 font-mono border ${aiCorrectionStatus === 'active'
+                ? 'bg-violet-700 text-white border-violet-800'
+                : aiCorrectionStatus === 'fallback'
+                  ? 'bg-slate-600 text-white border-slate-700'
+                  : 'bg-slate-200 text-slate-500 border-slate-300'
+                }`}
+              title={
+                aiCorrectionStatus === 'active'
+                  ? `AI IDR Active — Confidence: ${((telemetry.aiConfidence ?? 0) * 100).toFixed(0)}%`
+                  : aiCorrectionStatus === 'fallback'
+                    ? 'AI IDR: Model loaded, awaiting inference window'
+                    : 'AI IDR: Model unavailable — raw DR fusion active'
+              }
+            >
+              <Brain className="w-3 h-3" />
+              <span>
+                {aiCorrectionStatus === 'active'
+                  ? `AI ${((telemetry.aiConfidence ?? 0) * 100).toFixed(0)}%`
+                  : aiCorrectionStatus === 'fallback'
+                    ? 'AI ⋯'
+                    : 'AI —'
+                }
+              </span>
+            </div>
+
+            {/* 15-State EKF Fusion & GNSS Quality Badge */}
+            <div
+              className={`text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1 font-mono border ${
+                (fusedState?.sourceMode === 'IDR' || (!isGnssActive))
+                  ? 'bg-purple-700 text-white border-purple-800'
+                  : fusedState?.gnssState === 'DEGRADED'
+                  ? 'bg-amber-600 text-white border-amber-700'
+                  : 'bg-emerald-700 text-white border-emerald-800'
+              }`}
+              title={
+                fusedState
+                  ? `15-State EKF Fusion | Source: ${fusedState.sourceMode} | GNSS Quality: ${fusedState.gnssState} | Attitude: ${fusedState.isAligned ? 'Aligned ✓' : 'Aligning...'}`
+                  : `15-State EKF Engine Active`
+              }
+            >
+              <Activity className="w-3 h-3" />
+              <span>
+                {fusedState
+                  ? `EKF: ${fusedState.sourceMode} [${fusedState.gnssState}]`
+                  : isGnssActive
+                  ? 'EKF: GNSS [GOOD]'
+                  : 'EKF: IDR [ACTIVE]'}
+              </span>
+            </div>
+
+            {/* Real GNSS / DR Indicator */}
+            <div
+              className={`text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1 font-mono border ${isGnssActive
                 ? 'bg-emerald-600 text-white border-emerald-700'
                 : 'bg-amber-600 text-white border-amber-700'
-            }`}
-          >
-            {isGnssActive ? (
-              <>
-                <Satellite className="w-3 h-3" />
-                <span>GNSS</span>
-              </>
-            ) : (
-              <>
-                <Radio className="w-3 h-3 animate-pulse" />
-                <span>DR ENGAGED</span>
-              </>
-            )}
+                }`}
+            >
+              {isGnssActive ? (
+                <>
+                  <Satellite className="w-3 h-3" />
+                  <span>GNSS</span>
+                </>
+              ) : (
+                <>
+                  <Radio className="w-3 h-3 animate-pulse" />
+                  <span>DR ENGAGED</span>
+                </>
+              )}
+            </div>
+
+            {/* Mobile Test Guide Button */}
+            <button
+              onClick={() => setShowMobileGuide(true)}
+              className="text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1 font-mono border bg-blue-600 hover:bg-blue-700 text-white border-blue-700 cursor-pointer transition-colors"
+              title="Open Mobile Device Testing & Sensor Setup Guide"
+            >
+              <Smartphone className="w-3 h-3" />
+              <span>Mobile Test</span>
+            </button>
           </div>
         </div>
-      </div>
 
-      {/* Bottom Docked HUD Panel */}
-      <div className="absolute bottom-0 left-0 right-0 z-30 bg-white border-t border-slate-200 p-3 space-y-2.5 shadow-lg">
-        <div className="flex items-center justify-between gap-2">
-          {/* Speedometer & Heading Readout */}
-          <div className="flex flex-col">
-            <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">
-              Speed & Heading
-            </span>
-            <div className="flex items-baseline gap-2">
-              <span className="text-xl font-bold font-mono text-slate-900 leading-tight">
-                {telemetry.speed > 0 ? telemetry.speed.toFixed(1) : '0.0'}{' '}
-                <span className="text-xs font-normal text-slate-500 font-sans">
-                  {settings.speedUnit || 'km/h'}
+        {/* Mobile Testing Guide Modal */}
+        <MobileTestGuideModal isOpen={showMobileGuide} onClose={() => setShowMobileGuide(false)} />
+
+        {/* Bottom Docked HUD Panel */}
+        <div className="absolute bottom-0 left-0 right-0 z-30 bg-white border-t border-slate-200 p-3 space-y-2.5 shadow-lg">
+          <div className="flex items-center justify-between gap-2">
+            {/* Speedometer & Heading Readout */}
+            <div className="flex flex-col">
+              <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">
+                Speed & Heading
+              </span>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xl font-bold font-mono text-slate-900 leading-tight">
+                  {telemetry.speed > 0 ? telemetry.speed.toFixed(1) : '0.0'}{' '}
+                  <span className="text-xs font-normal text-slate-500 font-sans">
+                    {settings.speedUnit || 'km/h'}
+                  </span>
                 </span>
-              </span>
-              <span className="text-xs font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-mono">
-                {formattedHeading}
-              </span>
+                <span className="text-xs font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-mono">
+                  {formattedHeading}
+                </span>
+                <span
+                  className={`text-[10px] font-bold px-1.5 py-0.5 rounded border font-mono flex items-center gap-1 ${gnssBadge.bottomBadgeBg}`}
+                  title={gnssBadge.title}
+                >
+                  <div className={`w-1.5 h-1.5 rounded-full ${gnssBadge.dotColor}`} />
+                  <span>{gnssBadge.label}</span>
+                </span>
+              </div>
             </div>
-          </div>
 
-          {/* Trip Progress / ETA with Dynamic Distance Formatter */}
-          <div className="text-center">
-            <div className="text-sm font-bold text-slate-900 font-mono">
-              {remainingKm > 0
-                ? `${formatKmDistance(remainingKm, settings.distanceUnit)} left`
-                : 'Arrived'}
+            {/* Trip Progress / ETA with Dynamic Distance Formatter */}
+            <div className="text-center">
+              <div className="text-sm font-bold text-slate-900 font-mono">
+                {((fusedState && fusedState.latitude !== null && Math.abs(fusedState.latitude) > 0.0001) ||
+                  (currentLocation.latitude !== null && Math.abs(currentLocation.latitude) > 0.0001)) &&
+                remainingKm <= 0.05
+                  ? 'Arrived'
+                  : remainingKm > 0
+                  ? `${formatKmDistance(remainingKm, settings.distanceUnit)} left`
+                  : 'Calculating...'}
+              </div>
+              <button
+                onClick={onToggleCameraMode}
+                className="text-[11px] text-slate-500 font-mono mt-0.5 hover:text-blue-600 hover:underline cursor-pointer flex items-center justify-center gap-1"
+                title="Click to toggle camera orientation"
+              >
+                <span>{cameraMode === 'north-up' ? 'North-Up' : 'Head-Up (Follow)'}</span>
+                <span>•</span>
+                {isOnline ? (
+                  <span className="flex items-center gap-0.5 text-emerald-600">
+                    <Wifi className="w-3 h-3" /> Online
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-0.5 text-red-500">
+                    <WifiOff className="w-3 h-3" /> Offline
+                  </span>
+                )}
+              </button>
             </div>
+
+            {/* Exit Button */}
             <button
-              onClick={onToggleCameraMode}
-              className="text-[11px] text-slate-500 font-mono mt-0.5 hover:text-blue-600 hover:underline cursor-pointer flex items-center justify-center gap-1"
-              title="Click to toggle camera orientation"
+              onClick={() => setShowExitModal(true)}
+              className="px-3 py-1.5 text-xs font-bold text-red-600 border border-red-600 hover:bg-red-50 rounded-md transition-colors flex items-center gap-1 flex-shrink-0 cursor-pointer"
             >
-              <span>{cameraMode === 'north-up' ? 'North-Up' : 'Head-Up (Follow)'}</span>
-              <span>•</span>
-              {isOnline ? (
-                <span className="flex items-center gap-0.5 text-emerald-600">
-                  <Wifi className="w-3 h-3" /> Online
-                </span>
-              ) : (
-                <span className="flex items-center gap-0.5 text-red-500">
-                  <WifiOff className="w-3 h-3" /> Offline
-                </span>
-              )}
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Exit</span>
             </button>
           </div>
 
-          {/* Exit Button */}
+          {/* Complete Trip & View Genuine Analytics */}
           <button
-            onClick={() => setShowExitModal(true)}
-            className="px-3 py-1.5 text-xs font-bold text-red-600 border border-red-600 hover:bg-red-50 rounded-md transition-colors flex items-center gap-1 flex-shrink-0 cursor-pointer"
+            onClick={onEndNavigation}
+            className="w-full bg-blue-700 hover:bg-blue-800 text-white font-bold py-2 px-3 rounded-md transition-colors text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
           >
-            <LogOut className="w-3.5 h-3.5" />
-            <span>Exit</span>
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            <span>Complete Navigation & View Trip Summary</span>
           </button>
         </div>
 
-        {/* Complete Trip & View Genuine Analytics */}
-        <button
-          onClick={onEndNavigation}
-          className="w-full bg-blue-700 hover:bg-blue-800 text-white font-bold py-2 px-3 rounded-md transition-colors text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
-        >
-          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-          <span>Complete Navigation & View Trip Summary</span>
-        </button>
-      </div>
-
-      {/* Inline Exit Confirmation Dialog */}
-      {showExitModal && (
-        <div className="absolute inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-md p-4 w-full max-w-xs space-y-3 shadow-xl">
-            <h3 className="text-sm font-bold text-slate-900">Exit Navigation Session?</h3>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              Active turn-by-turn guidance and dead reckoning tracking will conclude.
-            </p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setShowExitModal(false)}
-                className="flex-1 py-1.5 text-xs font-bold border border-slate-300 text-slate-700 rounded-md hover:bg-slate-50 cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  setShowExitModal(false);
-                  onEndNavigation();
-                }}
-                className="flex-1 py-1.5 text-xs font-bold bg-red-600 text-white rounded-md hover:bg-red-700 cursor-pointer"
-              >
-                End & View Summary
-              </button>
+        {/* Inline Exit Confirmation Dialog */}
+        {showExitModal && (
+          <div className="absolute inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+            <div className="bg-white border border-slate-200 rounded-md p-4 w-full max-w-xs space-y-3 shadow-xl">
+              <h3 className="text-sm font-bold text-slate-900">Exit Navigation Session?</h3>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Active turn-by-turn guidance and dead reckoning tracking will conclude.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowExitModal(false)}
+                  className="flex-1 py-1.5 text-xs font-bold border border-slate-300 text-slate-700 rounded-md hover:bg-slate-50 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    setShowExitModal(false);
+                    onEndNavigation();
+                  }}
+                  className="flex-1 py-1.5 text-xs font-bold bg-red-600 text-white rounded-md hover:bg-red-700 cursor-pointer"
+                >
+                  End & View Summary
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
-    </>
-  );
-};
+        )}
+      </>
+    );
+  };
 
 export const NavigationHudPage: React.FC = () => {
   const navigate = useNavigate();
@@ -239,6 +384,8 @@ export const NavigationHudPage: React.FC = () => {
     showToast,
     recordSessionPoint,
     stopTrackingSession,
+    setAiCorrectionStatus,
+    fusedState,
   } = useNavigationContext();
 
   const [muted, setMuted] = useState(false);
@@ -246,14 +393,18 @@ export const NavigationHudPage: React.FC = () => {
 
   // Navigation Vehicle Positioning & Orientation
   const [currentVehiclePos, setCurrentVehiclePos] = useState<[number, number] | null>(
-    currentLocation.latitude !== null && currentLocation.longitude !== null
+    fusedState && fusedState.latitude !== null && fusedState.longitude !== null
+      ? [fusedState.latitude, fusedState.longitude]
+      : currentLocation.latitude !== null && currentLocation.longitude !== null
       ? [currentLocation.latitude, currentLocation.longitude]
       : routeState.startCoords || (routeState.routeCoordinates[0] ?? null)
   );
-  const [liveHeading, setLiveHeading] = useState<number>(0);
+  const [liveHeading, setLiveHeading] = useState<number>(fusedState?.heading || 0);
   const [remainingKm, setRemainingKm] = useState<number>(routeState.distanceKm || 0);
   const [drDrift, setDrDrift] = useState<number>(0.0);
-  const [isGnssLocked, setIsGnssLocked] = useState<boolean>(sensorStatus.gnss && !currentLocation.isStale);
+  const [isGnssLocked, setIsGnssLocked] = useState<boolean>(
+    fusedState ? fusedState.sourceMode === 'GNSS' : (sensorStatus.gnss && !currentLocation.isStale)
+  );
 
   // Multi-Trajectory Overlays State
   const [deadReckoningPath, setDeadReckoningPath] = useState<[number, number][]>([]);
@@ -267,14 +418,80 @@ export const NavigationHudPage: React.FC = () => {
   const currentVehiclePosRef = useRef<[number, number] | null>(currentVehiclePos);
   const accumulatedDriftRef = useRef<number>(0);
   const lastGnssFixTimeRef = useRef<number>(Date.now());
+  const lastRecordedPointTimeRef = useRef<number>(0);
 
   useEffect(() => {
     currentVehiclePosRef.current = currentVehiclePos;
   }, [currentVehiclePos]);
 
-  // Sync with central currentLocation whenever a fresh GPS fix arrives
+  // 1. Live 15-State EKF Fusion State Listener
   useEffect(() => {
     if (
+      fusedState &&
+      fusedState.latitude !== null &&
+      fusedState.longitude !== null
+    ) {
+      const newPos: [number, number] = [fusedState.latitude, fusedState.longitude];
+      setCurrentVehiclePos(newPos);
+      setLiveHeading(fusedState.heading);
+
+      const isIDR = fusedState.sourceMode === 'IDR';
+      setIsGnssLocked(!isIDR);
+
+      if (isIDR) {
+        setDeadReckoningPath((prev) => [...prev.slice(-100), newPos]);
+        accumulatedDriftRef.current += 0.05 * 0.1;
+        setDrDrift(Math.round(accumulatedDriftRef.current * 100) / 100);
+      } else {
+        lastGnssFixTimeRef.current = Date.now();
+        accumulatedDriftRef.current = 0;
+        setDrDrift(0.0);
+      }
+
+      const rawSpeedKmH = Math.sqrt(
+        fusedState.velocity.x * fusedState.velocity.x + fusedState.velocity.y * fusedState.velocity.y
+      ) * 3.6;
+      const speedKmH = rawSpeedKmH < 0.3 ? 0 : Math.round(rawSpeedKmH * 10) / 10;
+
+      // Throttle recording to 1 Hz so fix count matches elapsed session duration
+      const now = Date.now();
+      if (now - lastRecordedPointTimeRef.current >= 950 || lastRecordedPointTimeRef.current === 0) {
+        lastRecordedPointTimeRef.current = now;
+        recordSessionPoint({
+          timestamp: fusedState.timestamp,
+          lat: fusedState.latitude,
+          lng: fusedState.longitude,
+          accuracyMeters: (fusedState.accuracy !== null && fusedState.accuracy !== undefined)
+            ? fusedState.accuracy
+            : (currentLocation.accuracy !== null && currentLocation.accuracy !== undefined ? currentLocation.accuracy : undefined),
+          speedKmH,
+          headingDeg: fusedState.heading,
+          isDeadReckoning: isIDR,
+          rawInsVelX: fusedState.velocity.x,
+          rawInsVelY: fusedState.velocity.y,
+          aiCorrectedVelX: telemetry.aiCorrectedVelX,
+          aiCorrectedVelY: telemetry.aiCorrectedVelY,
+          aiConfidence: telemetry.aiConfidence,
+        });
+      }
+
+      if (routeState.routeCoordinates && routeState.routeCoordinates.length > 0) {
+        const { remainingDistanceKm } = calculateRemainingRoadDistance(
+          newPos,
+          routeState.routeCoordinates
+        );
+        setRemainingKm(remainingDistanceKm);
+      } else if (routeState.destCoords) {
+        const dist = haversineDistance(newPos[0], newPos[1], routeState.destCoords[0], routeState.destCoords[1]) / 1000.0;
+        setRemainingKm(Math.round(dist * 10) / 10);
+      }
+    }
+  }, [fusedState, recordSessionPoint, routeState.destCoords, routeState.routeCoordinates, telemetry.aiCorrectedVelX, telemetry.aiCorrectedVelY, telemetry.aiConfidence]);
+
+  // Sync with central currentLocation whenever a fresh GPS fix arrives if fusedState is not yet active
+  useEffect(() => {
+    if (
+      !fusedState &&
       currentLocation.latitude !== null &&
       currentLocation.longitude !== null &&
       !currentLocation.isStale
@@ -290,16 +507,20 @@ export const NavigationHudPage: React.FC = () => {
         gnssTrackHeadingRef.current = currentLocation.bearing;
       }
 
-      recordSessionPoint({
-        timestamp: currentLocation.timestamp || Date.now(),
-        lat: currentLocation.latitude,
-        lng: currentLocation.longitude,
-        accuracyMeters: currentLocation.accuracy || undefined,
-        speedKmH: currentLocation.speed || telemetry.speed,
-        headingDeg: currentLocation.bearing || liveHeading,
-        altitudeMeters: currentLocation.altitude || undefined,
-        isDeadReckoning: false,
-      });
+      const now = Date.now();
+      if (now - lastRecordedPointTimeRef.current >= 950 || lastRecordedPointTimeRef.current === 0) {
+        lastRecordedPointTimeRef.current = now;
+        recordSessionPoint({
+          timestamp: currentLocation.timestamp || now,
+          lat: currentLocation.latitude,
+          lng: currentLocation.longitude,
+          accuracyMeters: currentLocation.accuracy || undefined,
+          speedKmH: currentLocation.speed || telemetry.speed,
+          headingDeg: currentLocation.bearing || liveHeading,
+          altitudeMeters: currentLocation.altitude || undefined,
+          isDeadReckoning: false,
+        });
+      }
 
       if (routeState.routeCoordinates && routeState.routeCoordinates.length > 0) {
         const { remainingDistanceKm } = calculateRemainingRoadDistance(
@@ -308,11 +529,11 @@ export const NavigationHudPage: React.FC = () => {
         );
         setRemainingKm(remainingDistanceKm);
       } else if (routeState.destCoords) {
-        const dist = DeadReckoningEngine.calculateHaversineDistance(newPos, routeState.destCoords);
+        const dist = haversineDistance(newPos[0], newPos[1], routeState.destCoords[0], routeState.destCoords[1]) / 1000.0;
         setRemainingKm(Math.round(dist * 10) / 10);
       }
     }
-  }, [currentLocation, recordSessionPoint, routeState.destCoords, routeState.routeCoordinates, liveHeading, telemetry.speed]);
+  }, [currentLocation, fusedState, recordSessionPoint, routeState.destCoords, routeState.routeCoordinates, liveHeading, telemetry.speed]);
 
   // 1. Hardware Sensor Listeners for Compass & Gyroscope Fusion
   useEffect(() => {
@@ -325,16 +546,47 @@ export const NavigationHudPage: React.FC = () => {
   }, [realSensors.headingDeg, realSensors.gz]);
 
   // 2. Shortest-Path Angular Fusion & 10 Hz Ticker
+  // Keep refs for 10 Hz ticker to prevent constant effect teardown/recreation
+  const telemetryRef = useRef(telemetry);
+  const isGnssLockedRef = useRef(isGnssLocked);
+  const routeStateRef = useRef(routeState);
+  const recordSessionPointRef = useRef(recordSessionPoint);
+  const fusedStateRef = useRef(fusedState);
+
+  useEffect(() => {
+    fusedStateRef.current = fusedState;
+  }, [fusedState]);
+
+  useEffect(() => {
+    telemetryRef.current = telemetry;
+  }, [telemetry]);
+
+  useEffect(() => {
+    isGnssLockedRef.current = isGnssLocked;
+  }, [isGnssLocked]);
+
+  useEffect(() => {
+    routeStateRef.current = routeState;
+  }, [routeState]);
+
+  useEffect(() => {
+    recordSessionPointRef.current = recordSessionPoint;
+  }, [recordSessionPoint]);
+
+  // 2. Shortest-Path Angular Fusion & 10 Hz Ticker
   useEffect(() => {
     const dt = 0.1; // 100 ms = 10 Hz ticker
-    const intervalId = setInterval(() => {
+    const intervalId = setInterval(async () => {
       const prevHeading = fusedHeadingRef.current;
       const prevPos = prevVehiclePosRef.current;
       const currPos = currentVehiclePosRef.current;
+      const currTelemetry = telemetryRef.current;
+      const currGnssLocked = isGnssLockedRef.current;
+      const currRouteState = routeStateRef.current;
 
       let trajBearing: number | null = null;
       if (prevPos && currPos) {
-        const dist = DeadReckoningEngine.calculateHaversineDistance(prevPos, currPos);
+        const dist = haversineDistance(prevPos[0], prevPos[1], currPos[0], currPos[1]) / 1000.0;
         if (dist > 0.0005) {
           trajBearing = OrientationService.calculateBearing(prevPos, currPos);
         }
@@ -345,8 +597,8 @@ export const NavigationHudPage: React.FC = () => {
         gnssTrackBearing: gnssTrackHeadingRef.current,
         trajectoryBearing: trajBearing,
         gyroZRate: gyroZRateRef.current,
-        speedKmH: telemetry.speed || 0,
-        isGnssAvailable: isGnssLocked,
+        speedKmH: currTelemetry.speed || 0,
+        isGnssAvailable: currGnssLocked,
         deltaTimeSec: dt,
         previousHeading: prevHeading,
       });
@@ -355,20 +607,20 @@ export const NavigationHudPage: React.FC = () => {
       setLiveHeading(fused);
       prevVehiclePosRef.current = currPos;
 
-      // If GNSS has been lost for > 3 seconds, engage Dead Reckoning kinematic stepping
+      // If GNSS has been lost for > 3 seconds and EKF is not active, engage fallback Dead Reckoning kinematic stepping
       const timeSinceLastGnss = Date.now() - lastGnssFixTimeRef.current;
-      if (timeSinceLastGnss > 3000 && currPos) {
+      if (!fusedStateRef.current && timeSinceLastGnss > 3000 && currPos) {
         setIsGnssLocked(false);
 
         // Execute Dead Reckoning kinematic step with actual sensor linear acceleration
         const accelMag = Math.sqrt(
-          telemetry.ax * telemetry.ax +
-          telemetry.ay * telemetry.ay
+          currTelemetry.ax * currTelemetry.ax +
+          currTelemetry.ay * currTelemetry.ay
         );
 
         const drStep = DeadReckoningEngine.stepKinematics(
           currPos,
-          telemetry.speed || 0,
+          currTelemetry.speed || 0,
           accelMag,
           fused,
           dt,
@@ -380,31 +632,75 @@ export const NavigationHudPage: React.FC = () => {
         setCurrentVehiclePos(drStep.position);
         setDeadReckoningPath((prev) => [...prev.slice(-100), drStep.position]);
 
-        // Record DR point to session
-        recordSessionPoint({
-          timestamp: Date.now(),
-          lat: drStep.position[0],
-          lng: drStep.position[1],
-          speedKmH: drStep.velocitySpeedKmH,
-          headingDeg: fused,
-          isDeadReckoning: true,
-        });
+        // --- AI Error Correction layer (runs AFTER raw DR step) ---
+        // Raw INS velocity from DR step (in 2D horizontal ENU plane)
+        const rawInsVelX = (drStep.velocitySpeedKmH * 1000 / 3600) * Math.sin((fused * Math.PI) / 180);
+        const rawInsVelY = (drStep.velocitySpeedKmH * 1000 / 3600) * Math.cos((fused * Math.PI) / 180);
 
-        if (routeState.routeCoordinates && routeState.routeCoordinates.length > 0) {
+        let aiCorrectedVelX: number | null = null;
+        let aiCorrectedVelY: number | null = null;
+        let aiConfidence: number | null = null;
+        let newAiStatus: 'active' | 'fallback' | 'unavailable' = 'fallback';
+
+        if (AIErrorCorrectionService.getStatus() === 'ready' && AIErrorCorrectionService.isBufferReady()) {
+          try {
+            const aiResult = await AIErrorCorrectionService.correct({
+              velX: rawInsVelX,
+              velY: rawInsVelY,
+            });
+            if (aiResult !== null) {
+              aiCorrectedVelX = aiResult.correctedVelX;
+              aiCorrectedVelY = aiResult.correctedVelY;
+              aiConfidence = aiResult.confidence;
+              newAiStatus = 'active';
+            } else {
+              newAiStatus = 'fallback';
+            }
+          } catch {
+            newAiStatus = 'fallback';
+          }
+        } else if (AIErrorCorrectionService.getStatus() === 'unavailable') {
+          newAiStatus = 'unavailable';
+        }
+
+        // Update AI correction status in context
+        setAiCorrectionStatus(newAiStatus);
+
+        // Record DR point to session at 1 Hz — includes raw DR + AI-corrected columns
+        const nowMs = Date.now();
+        if (nowMs - lastRecordedPointTimeRef.current >= 950) {
+          lastRecordedPointTimeRef.current = nowMs;
+          recordSessionPointRef.current({
+            timestamp: nowMs,
+            lat: drStep.position[0],
+            lng: drStep.position[1],
+            accuracyMeters: (currentLocation.accuracy !== null && currentLocation.accuracy !== undefined) ? currentLocation.accuracy : undefined,
+            speedKmH: drStep.velocitySpeedKmH,
+            headingDeg: fused,
+            isDeadReckoning: true,
+            rawInsVelX,
+            rawInsVelY,
+            aiCorrectedVelX,
+            aiCorrectedVelY,
+            aiConfidence,
+          });
+        }
+
+        if (currRouteState.routeCoordinates && currRouteState.routeCoordinates.length > 0) {
           const { remainingDistanceKm } = calculateRemainingRoadDistance(
             drStep.position,
-            routeState.routeCoordinates
+            currRouteState.routeCoordinates
           );
           setRemainingKm(remainingDistanceKm);
-        } else if (routeState.destCoords) {
-          const dist = DeadReckoningEngine.calculateHaversineDistance(drStep.position, routeState.destCoords);
+        } else if (currRouteState.destCoords) {
+          const dist = haversineDistance(drStep.position[0], drStep.position[1], currRouteState.destCoords[0], currRouteState.destCoords[1]) / 1000.0;
           setRemainingKm(Math.round(dist * 10) / 10);
         }
       }
     }, 100);
 
     return () => clearInterval(intervalId);
-  }, [telemetry.speed, telemetry.ax, telemetry.ay, isGnssLocked, routeState.destCoords, routeState.routeCoordinates, recordSessionPoint]);
+  }, []);
 
   const handleEndNavigation = () => {
     stopTrackingSession();
@@ -455,6 +751,8 @@ export const NavigationHudPage: React.FC = () => {
     </div>
   );
 
+  const gnssBadge = getGnssStatusBadge(fusedState, isGnssLocked);
+
   return (
     <MobileShell header={topBanner} hideHeaderPadding hideFooterPadding>
       <div className="relative h-full w-full bg-slate-50 overflow-hidden">
@@ -475,6 +773,7 @@ export const NavigationHudPage: React.FC = () => {
             liveHeading={liveHeading}
             vehicleType={routeState.vehicleType || 'car'}
             cameraMode={cameraMode}
+            gnssBadge={gnssBadge}
             onToggleCameraMode={() =>
               setCameraMode((prev) => (prev === 'north-up' ? 'head-up' : 'north-up'))
             }
@@ -486,9 +785,8 @@ export const NavigationHudPage: React.FC = () => {
           {/* Audio Mute Toggle */}
           <button
             onClick={() => setMuted(!muted)}
-            className={`w-9 h-9 bg-white border border-slate-200 rounded-md flex items-center justify-center transition-colors shadow-xs cursor-pointer ${
-              muted ? 'text-red-600' : 'text-slate-900'
-            }`}
+            className={`w-9 h-9 bg-white border border-slate-200 rounded-md flex items-center justify-center transition-colors shadow-xs cursor-pointer ${muted ? 'text-red-600' : 'text-slate-900'
+              }`}
             title="Toggle Mute"
             aria-label="Toggle Mute"
           >
@@ -498,9 +796,8 @@ export const NavigationHudPage: React.FC = () => {
           {/* Compass / Camera Mode Switcher (North-Up vs Head-Up) */}
           <button
             onClick={() => setCameraMode((prev) => (prev === 'north-up' ? 'head-up' : 'north-up'))}
-            className={`w-9 h-9 bg-white border border-slate-200 rounded-md flex items-center justify-center transition-colors shadow-xs cursor-pointer ${
-              cameraMode === 'head-up' ? 'text-blue-700 bg-blue-50 border-blue-300' : 'text-slate-600'
-            }`}
+            className={`w-9 h-9 bg-white border border-slate-200 rounded-md flex items-center justify-center transition-colors shadow-xs cursor-pointer ${cameraMode === 'head-up' ? 'text-blue-700 bg-blue-50 border-blue-300' : 'text-slate-600'
+              }`}
             title={`Current Camera: ${cameraMode === 'north-up' ? 'North-Up' : 'Head-Up (Follow Vehicle)'}`}
             aria-label="Toggle Camera Mode"
           >

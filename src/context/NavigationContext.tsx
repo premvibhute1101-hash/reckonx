@@ -14,12 +14,17 @@ import type {
   CurrentLocationData,
   RealSensorData,
   SystemDataMode,
+  AICorrectionStatus,
 } from '../types/navigation';
 import { LocationService } from '../services/locationService';
 import { RouteService } from '../services/routeService';
 import { SensorService } from '../services/sensorService';
 import { TileCacheService } from '../services/tileCacheService';
 import { LogExportService } from '../services/logExportService';
+import { AIErrorCorrectionService } from '../services/AIErrorCorrectionService';
+import { backendService, type BackendConnectionStatus } from '../services/BackendService';
+import { fusionRuntime } from '../services/ekf';
+import type { FusedState } from '../services/ekf';
 import { formatKmDistance } from '../utils/distanceFormatter';
 import type { RecordedGPSPoint } from '../services/api/trackingService';
 
@@ -125,6 +130,9 @@ const initialTelemetry: TelemetryData = {
   ax: 0,
   ay: 0,
   az: 0,
+  gx: 0,
+  gy: 0,
+  gz: 0,
   pitch: 0.0,
   roll: 0.0,
   yaw: 0.0,
@@ -132,6 +140,9 @@ const initialTelemetry: TelemetryData = {
   isStreamingMotion: false,
   isStreamingOrientation: false,
   lastEventTimestamp: null,
+  aiCorrectedVelX: null,
+  aiCorrectedVelY: null,
+  aiConfidence: null,
 };
 
 const initialUser: UserProfile = {
@@ -175,6 +186,47 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
   const [sensorEventsStream, setSensorEventsStream] = useState<SensorEventLogEntry[]>([]);
   const [trackingSession, setTrackingSession] = useState<ActiveTrackingSession>(initialTrackingSession);
+  const [fusedState, setFusedState] = useState<FusedState | null>(null);
+
+  // EKF Fusion Runtime Lifecycle
+  useEffect(() => {
+    fusionRuntime.setOnFusedDataCallback((state) => {
+      setFusedState(state);
+      if (state.velocity) {
+        const speedKmH = Math.sqrt(
+          state.velocity.x * state.velocity.x + state.velocity.y * state.velocity.y
+        ) * 3.6;
+        // Clean stationary deadband: below 0.3 km/h (~0.08 m/s) is snapped to exactly 0.0 km/h
+        const cleanSpeed = speedKmH < 0.3 ? 0 : Math.round(speedKmH * 10) / 10;
+        setTelemetry((prev) => ({
+          ...prev,
+          speed: cleanSpeed,
+        }));
+      }
+    });
+    fusionRuntime.start();
+    return () => {
+      fusionRuntime.stop();
+    };
+  }, []);
+
+  // AI Error Correction Status — follows ref-based concurrency pattern
+  const [aiCorrectionStatus, setAiCorrectionStatus] = useState<AICorrectionStatus>('unavailable');
+  // Ref so the 10Hz ticker can read current status without stale closure
+  const aiCorrectionStatusRef = useRef<AICorrectionStatus>('unavailable');
+  useEffect(() => {
+    aiCorrectionStatusRef.current = aiCorrectionStatus;
+  }, [aiCorrectionStatus]);
+
+  // Backend Connection Status ('connected' | 'offline' | 'error')
+  const [backendConnectionStatus, setBackendConnectionStatus] = useState<BackendConnectionStatus>('offline');
+
+  useEffect(() => {
+    const unsubscribe = backendService.subscribeStatus((status) => {
+      setBackendConnectionStatus(status);
+    });
+    return () => unsubscribe();
+  }, []);
 
   // Network Online & Operational Matrix Scenario State
   const [isOnline, setIsOnline] = useState<boolean>(
@@ -189,8 +241,24 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   // Event frequency counter
   const eventTimestampsRef = useRef<number[]>([]);
 
+
   // Track if origin was set manually by user
   const isOriginManualRef = useRef<boolean>(false);
+
+  // =========================================================================
+  // AI MODEL — Load once on mount, never re-created
+  // =========================================================================
+  useEffect(() => {
+    let cancelled = false;
+    AIErrorCorrectionService.loadModel().then((status) => {
+      if (cancelled) return;
+      const mapped: AICorrectionStatus =
+        status === 'ready' ? 'fallback' : 'unavailable'; // starts as fallback until first inference
+      setAiCorrectionStatus(mapped);
+      aiCorrectionStatusRef.current = mapped;
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   // Refresh cached tiles count from IndexedDB
   const refreshCacheCount = useCallback(async () => {
@@ -302,6 +370,25 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       const rawAy = data.ay - offset.ay;
       const rawAz = data.az - offset.az;
 
+      // Always feed real gravity-compensated accel + gyro into the AI rolling buffer at full frequency
+      const DEG_TO_RAD = Math.PI / 180;
+      AIErrorCorrectionService.pushSample({
+        accX: rawAx,
+        accY: rawAy,
+        accZ: rawAz,
+        gyroYaw:   data.gz * DEG_TO_RAD,
+        gyroPitch: data.gx * DEG_TO_RAD,
+        gyroRoll:  data.gy * DEG_TO_RAD,
+      });
+
+      // Feed high-rate IMU data into 15-state EKF FusionRuntime
+      fusionRuntime.processImuSample(
+        { x: rawAx, y: rawAy, z: rawAz },
+        { x: data.gx * DEG_TO_RAD, y: data.gy * DEG_TO_RAD, z: data.gz * DEG_TO_RAD },
+        now
+      );
+
+
       eventTimestampsRef.current.push(now);
       const oneSecAgo = now - 1000;
       eventTimestampsRef.current = eventTimestampsRef.current.filter((t) => t > oneSecAgo);
@@ -327,12 +414,15 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         ax: Math.round(rawAx * 100) / 100,
         ay: Math.round(rawAy * 100) / 100,
         az: Math.round(rawAz * 100) / 100,
+        gx: Math.round(data.gx * 100) / 100,
+        gy: Math.round(data.gy * 100) / 100,
+        gz: Math.round(data.gz * 100) / 100,
         sampleRateHz: currentRate,
         isStreamingMotion: true,
         lastEventTimestamp: now,
       }));
 
-      setSensorStatus((prev) => ({ ...prev, accel: true, gyro: true }));
+      setSensorStatus((prev) => (prev.accel && prev.gyro ? prev : { ...prev, accel: true, gyro: true }));
 
       // Add to rolling sensor event stream (limit 20 entries)
       setSensorEventsStream((prev) => [
@@ -350,6 +440,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     // Orientation Sensor (Pitch, Roll, Yaw, Heading)
     const unsubOrientation = SensorService.subscribeOrientation((data) => {
       const now = Date.now();
+
 
       setRealSensors((prev) => ({
         ...prev,
@@ -370,7 +461,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       }));
 
       if (data.alpha !== null || data.headingDeg !== null) {
-        setSensorStatus((prev) => ({ ...prev, compass: true }));
+        setSensorStatus((prev) => (prev.compass ? prev : { ...prev, compass: true }));
       }
 
       setSensorEventsStream((prev) => [
@@ -456,6 +547,18 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
         if (pos.speed !== null && pos.speed >= 0) {
           setTelemetry((prev) => ({ ...prev, speed: pos.speed || 0 }));
+        }
+
+        // Feed GNSS fix into 15-state EKF FusionRuntime
+        if (pos.latitude !== null && pos.longitude !== null) {
+          fusionRuntime.updateGnss({
+            latitude: pos.latitude,
+            longitude: pos.longitude,
+            accuracy: pos.accuracy,
+            speed: pos.speed !== null ? (pos.speed * 1000) / 3600 : null,
+            heading: pos.bearing,
+            timestamp: pos.timestamp || Date.now(),
+          });
         }
       },
       (error) => {
@@ -964,10 +1067,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   // Tracking Session Lifecycle
   const startTrackingSession = useCallback(() => {
     const sessionId = `session-${Date.now()}`;
+    const startTime = Date.now();
     setTrackingSession({
       isActive: true,
       sessionId,
-      startTime: Date.now(),
+      startTime,
       endTime: null,
       points: [],
       totalDistanceKm: 0,
@@ -977,8 +1081,24 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       drPointsCount: 0,
       gnssOutageDurationSec: 0,
     });
+
+    // Create initial session record in backend DB asynchronously (non-blocking)
+    backendService.syncSession({
+      sessionId,
+      startTime,
+      originAddress: routeState.origin || 'Current Location',
+      destAddress: routeState.destination || 'Selected Destination',
+      startCoords: routeState.startCoords || [0, 0],
+      destCoords: routeState.destCoords || [0, 0],
+      points: [],
+      totalDistanceKm: 0,
+      durationSeconds: 0,
+      gnssPointsCount: 0,
+      drPointsCount: 0,
+    }).catch(() => {});
+
     showToast('Live navigation tracking session started');
-  }, [showToast]);
+  }, [showToast, routeState]);
 
   const stopTrackingSession = useCallback(() => {
     setTrackingSession((prev) => {
@@ -995,22 +1115,46 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
       const avgSpeed = count > 0 ? Math.round((totalSpeed / count) * 10) / 10 : 0;
 
-      return {
+      const finalSession = {
         ...prev,
         isActive: false,
         endTime,
         maxSpeedKmH: maxSpeed,
         averageSpeedKmH: avgSpeed,
       };
+
+      const sessionStartTime = prev.startTime || Date.now();
+
+      // Sync completed session to backend asynchronously (non-blocking)
+      backendService.syncSession({
+        sessionId: prev.sessionId,
+        startTime: sessionStartTime,
+        endTime,
+        originAddress: routeState.origin || 'Current Location',
+        destAddress: routeState.destination || 'Selected Destination',
+        startCoords: routeState.startCoords || [0, 0],
+        destCoords: routeState.destCoords || [0, 0],
+        points: prev.points,
+        totalDistanceKm: prev.totalDistanceKm,
+        durationSeconds: Math.round((endTime - sessionStartTime) / 1000),
+        gnssPointsCount: prev.gnssPointsCount,
+        drPointsCount: prev.drPointsCount,
+      }).catch(() => {});
+
+      return finalSession;
     });
     showToast('Tracking session concluded');
-  }, [showToast]);
+  }, [showToast, routeState]);
 
   const recordSessionPoint = useCallback((point: RecordedGPSPoint) => {
     setTrackingSession((prev) => {
       if (!prev.isActive) return prev;
       const updatedPoints = [...prev.points, point];
       const isDR = !!point.isDeadReckoning;
+
+      // Sync point batch to backend asynchronously (non-blocking)
+      backendService.syncTelemetryBatch(prev.sessionId || undefined, [point]).catch(() => {});
+
       return {
         ...prev,
         points: updatedPoints,
@@ -1036,6 +1180,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   return (
     <NavigationContext.Provider
       value={{
+        aiCorrectionStatus,
+        backendConnectionStatus,
+        fusedState,
         currentLocation,
         realSensors,
         systemMode,
@@ -1056,6 +1203,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         setSystemMode,
         refreshGpsLocation,
         setMatrixScenario,
+        setAiCorrectionStatus,
         calibrateCompass,
         grantGnssPermission,
         grantAllSensors,

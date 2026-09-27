@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import { TopHeader } from '../components/TopHeader';
 import { BottomNav } from '../components/BottomNav';
 import { TelemetryChart } from '../components/TelemetryChart';
+import { GyroscopeChart } from '../components/GyroscopeChart';
+import { OrientationChart } from '../components/OrientationChart';
 import { useNavigationContext } from '../context/NavigationContext';
 import {
   RotateCw,
@@ -28,6 +30,7 @@ export const TelemetryPage: React.FC = () => {
     toggleSensors,
     refreshGpsLocation,
     resetSensorZeroPoint,
+    fusedState,
   } = useNavigationContext();
 
   const header = (
@@ -245,6 +248,103 @@ export const TelemetryPage: React.FC = () => {
           </div>
         )}
 
+        {/* 2.5 15-STATE EKF SENSOR FUSION ENGINE CARD */}
+        <div className="bg-white border border-slate-200 rounded-lg p-3.5 shadow-xs space-y-2.5">
+          <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+            <div className="flex items-center gap-1.5">
+              <Activity className="w-4 h-4 text-purple-700" />
+              <span className="text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
+                15-State EKF Sensor Fusion Engine
+              </span>
+            </div>
+            <span
+              className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
+                fusedState?.sourceMode === 'IDR'
+                  ? 'bg-purple-100 text-purple-800 border-purple-300'
+                  : 'bg-emerald-100 text-emerald-800 border-emerald-300'
+              }`}
+            >
+              {fusedState ? `MODE: ${fusedState.sourceMode}` : 'INITIALIZING'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 text-xs font-mono">
+            {/* GNSS Quality State */}
+            <div className="bg-slate-50 p-2 rounded border border-slate-200">
+              <span className="text-[10px] text-slate-400 block font-sans">GNSS Quality State</span>
+              <span
+                className={`font-bold ${
+                  fusedState?.gnssState === 'GOOD'
+                    ? 'text-emerald-700'
+                    : fusedState?.gnssState === 'DEGRADED'
+                    ? 'text-amber-700'
+                    : 'text-red-700'
+                }`}
+              >
+                {fusedState?.gnssState || (sensorStatus.gnss ? 'GOOD' : 'WEAK_LOST')}
+              </span>
+            </div>
+
+            {/* Attitude Alignment */}
+            <div className="bg-slate-50 p-2 rounded border border-slate-200">
+              <span className="text-[10px] text-slate-400 block font-sans">Attitude Alignment</span>
+              <span className={`font-bold ${fusedState?.isAligned ? 'text-emerald-700' : 'text-amber-700'}`}>
+                {fusedState?.isAligned ? 'ALIGNED ✓' : 'ALIGNING (Rest)'}
+              </span>
+            </div>
+
+            {/* Output Stabilizer */}
+            <div className="bg-slate-50 p-2 rounded border border-slate-200">
+              <span className="text-[10px] text-slate-400 block font-sans">Stabilizer Filter</span>
+              <span className="font-bold text-slate-800">
+                {fusedState?.stabilization?.wasClamped
+                  ? 'Clamped ⚠'
+                  : fusedState?.stabilization?.wasSmoothed
+                  ? 'Smoothed ✓'
+                  : 'Active'}
+              </span>
+            </div>
+          </div>
+
+          {/* Accel & Gyro Biases */}
+          <div className="grid grid-cols-2 gap-2 text-xs font-mono">
+            <div className="bg-slate-50 p-2 rounded border border-slate-200 space-y-0.5">
+              <span className="text-[10px] text-slate-400 block font-sans font-bold">Estimated Accel Bias (m/s²)</span>
+              <div className="text-[11px] text-slate-700">
+                X: <span className="font-bold">{fusedState?.accelBias?.x?.toFixed(4) || '0.0000'}</span> | Y:{' '}
+                <span className="font-bold">{fusedState?.accelBias?.y?.toFixed(4) || '0.0000'}</span> | Z:{' '}
+                <span className="font-bold">{fusedState?.accelBias?.z?.toFixed(4) || '0.0000'}</span>
+              </div>
+            </div>
+
+            <div className="bg-slate-50 p-2 rounded border border-slate-200 space-y-0.5">
+              <span className="text-[10px] text-slate-400 block font-sans font-bold">Estimated Gyro Bias (rad/s)</span>
+              <div className="text-[11px] text-slate-700">
+                X: <span className="font-bold">{fusedState?.gyroBias?.x?.toFixed(5) || '0.00000'}</span> | Y:{' '}
+                <span className="font-bold">{fusedState?.gyroBias?.y?.toFixed(5) || '0.00000'}</span> | Z:{' '}
+                <span className="font-bold">{fusedState?.gyroBias?.z?.toFixed(5) || '0.00000'}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Fused Position vs Pure INS */}
+          {fusedState?.latitude !== null && fusedState?.latitude !== undefined && (
+            <div className="bg-purple-50/50 p-2 rounded border border-purple-200 text-xs font-mono space-y-0.5">
+              <span className="text-[10px] text-purple-700 block font-sans font-bold">
+                Fused EKF Position vs Pure Mechanized INS
+              </span>
+              <div className="text-[11px] text-slate-800">
+                Fused: <span className="font-bold">{fusedState.latitude.toFixed(6)}, {fusedState.longitude?.toFixed(6)}</span> | Heading: <span className="font-bold">{fusedState.heading.toFixed(1)}°</span>
+              </div>
+              {fusedState.pureInsLatitude !== null && fusedState.pureInsLatitude !== undefined && (
+                <div className="text-[10px] text-slate-500">
+                  Pure INS: {fusedState.pureInsLatitude.toFixed(6)}, {fusedState.pureInsLongitude?.toFixed(6)}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
         {/* 3. LOCATION DEBUG & REAL GPS DIAGNOSTIC PANEL */}
         <div className="bg-white border border-slate-200 rounded-lg p-4 shadow-xs space-y-3">
           <div className="flex items-center justify-between border-b border-slate-200 pb-2">
@@ -343,8 +443,14 @@ export const TelemetryPage: React.FC = () => {
           </div>
         </div>
 
-        {/* 4. Real Canvas Waveform */}
-        {isSensorsEnabled && <TelemetryChart />}
+        {/* 4. Real Canvas Waveforms */}
+        {isSensorsEnabled && (
+          <div className="space-y-3">
+            <TelemetryChart />
+            <GyroscopeChart />
+            <OrientationChart />
+          </div>
+        )}
 
         {/* 5. Live Event Ingestion Stream Log */}
         <div className="bg-white border border-slate-200 rounded-lg p-3.5 space-y-2 shadow-xs">

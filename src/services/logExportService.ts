@@ -61,6 +61,15 @@ export const LogExportService = {
       'Heading_Deg',
       'Altitude_Meters',
       'Is_Dead_Reckoning',
+      // AI Correction columns — populated during DR epochs
+      'Raw_DR_VelX_ms',      // Raw INS velocity X (m/s ENU) before AI correction
+      'Raw_DR_VelY_ms',      // Raw INS velocity Y (m/s ENU) before AI correction
+      'AI_Corrected_VelX_ms', // AI-corrected velocity X (m/s ENU), blank on fallback
+      'AI_Corrected_VelY_ms', // AI-corrected velocity Y (m/s ENU), blank on fallback
+      'AI_Confidence',        // Confidence proxy [0..1], blank on fallback
+      // GPS ground truth columns (same as lat/lng for GNSS points)
+      'GPS_GroundTruth_Lat',
+      'GPS_GroundTruth_Lng',
     ];
 
     rows.push(headers.join(','));
@@ -72,14 +81,24 @@ export const LogExportService = {
         pt.isDeadReckoning ? 'DEAD_RECKONING' : 'GNSS',
         pt.lat !== undefined ? pt.lat.toFixed(6) : '',
         pt.lng !== undefined ? pt.lng.toFixed(6) : '',
-        pt.accuracyMeters !== undefined ? pt.accuracyMeters.toFixed(1) : '',
+        pt.accuracyMeters !== undefined && pt.accuracyMeters !== null && !isNaN(pt.accuracyMeters) ? pt.accuracyMeters.toFixed(1) : '',
         pt.speedKmH !== undefined ? pt.speedKmH.toFixed(1) : '',
         pt.headingDeg !== undefined ? pt.headingDeg.toFixed(1) : '',
         pt.altitudeMeters !== undefined && pt.altitudeMeters !== null ? pt.altitudeMeters.toFixed(1) : '',
         pt.isDeadReckoning ? 'TRUE' : 'FALSE',
+        // AI correction columns
+        pt.rawInsVelX !== undefined ? pt.rawInsVelX.toFixed(4) : '',
+        pt.rawInsVelY !== undefined ? pt.rawInsVelY.toFixed(4) : '',
+        pt.aiCorrectedVelX != null ? pt.aiCorrectedVelX.toFixed(4) : '',
+        pt.aiCorrectedVelY != null ? pt.aiCorrectedVelY.toFixed(4) : '',
+        pt.aiConfidence != null ? pt.aiConfidence.toFixed(4) : '',
+        // GPS ground truth (for GNSS points, mirrors lat/lng; for DR points, blank)
+        pt.gpsGroundTruthLat !== undefined ? pt.gpsGroundTruthLat.toFixed(6) : (!pt.isDeadReckoning && pt.lat !== undefined ? pt.lat.toFixed(6) : ''),
+        pt.gpsGroundTruthLng !== undefined ? pt.gpsGroundTruthLng.toFixed(6) : (!pt.isDeadReckoning && pt.lng !== undefined ? pt.lng.toFixed(6) : ''),
       ];
       rows.push(row.join(','));
     }
+
 
     const csvContent = rows.join('\r\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });

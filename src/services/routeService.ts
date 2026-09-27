@@ -14,8 +14,12 @@
  */
 
 import { MAP_CONFIG } from '../config/mapConfig';
-import { DeadReckoningEngine } from './deadReckoningEngine';
+import { haversineDistance } from './ekf/OutputStabilizer';
 import type { VehicleType, RouteStep, RouteOption, NormalizedRouteResult } from '../types/navigation';
+
+function calculateDistanceKm(p1: [number, number], p2: [number, number]): number {
+  return haversineDistance(p1[0], p1[1], p2[0], p2[1]) / 1000.0;
+}
 
 export interface RouteRequestOptions {
   origin: [number, number]; // [lat, lng]
@@ -43,7 +47,7 @@ export class RouteService {
       throw new Error('Invalid coordinate range provided for route calculation.');
     }
 
-    const straightDistKm = DeadReckoningEngine.calculateHaversineDistance(origin, destination);
+    const straightDistKm = calculateDistanceKm(origin, destination);
     const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
 
     if (!isOnline) {
@@ -98,7 +102,7 @@ export class RouteService {
     const [startLat, startLng] = origin;
     const [destLat, destLng] = destination;
     const coordsStr = `${startLng},${startLat};${destLng},${destLat}`;
-    const distKm = straightDistKm || DeadReckoningEngine.calculateHaversineDistance(origin, destination);
+    const distKm = straightDistKm || calculateDistanceKm(origin, destination);
 
     const primaryUrl = `${MAP_CONFIG.ROUTING.CAR_BASE_URL}/route/v1/driving/${coordsStr}?overview=full&geometries=geojson&alternatives=${alternatives}&steps=true`;
     const fallbackUrl = `${MAP_CONFIG.ROUTING.CAR_FALLBACK_URL}/route/v1/driving/${coordsStr}?overview=full&geometries=geojson&alternatives=${alternatives}&steps=true`;
@@ -162,7 +166,7 @@ export class RouteService {
     const [startLat, startLng] = origin;
     const [destLat, destLng] = destination;
     const coordsStr = `${startLng},${startLat};${destLng},${destLat}`;
-    const distKm = straightDistKm || DeadReckoningEngine.calculateHaversineDistance(origin, destination);
+    const distKm = straightDistKm || calculateDistanceKm(origin, destination);
 
     const bikeUrl = `${MAP_CONFIG.ROUTING.BIKE_BASE_URL}/route/v1/driving/${coordsStr}?overview=full&geometries=geojson&alternatives=${alternatives}&steps=true`;
 
@@ -209,7 +213,7 @@ export class RouteService {
     const [startLat, startLng] = origin;
     const [destLat, destLng] = destination;
     const coordsStr = `${startLng},${startLat};${destLng},${destLat}`;
-    const distKm = straightDistKm || DeadReckoningEngine.calculateHaversineDistance(origin, destination);
+    const distKm = straightDistKm || calculateDistanceKm(origin, destination);
 
     const footUrl = `${MAP_CONFIG.ROUTING.FOOT_BASE_URL}/route/v1/driving/${coordsStr}?overview=full&geometries=geojson&alternatives=${alternatives}&steps=true`;
 

@@ -93,6 +93,15 @@ const createChevronIcon = (heading: number = 0, vehicleType: 'car' | 'bike' | 'w
   });
 };
 
+// Coordinate validity guard to prevent centering on [0,0] / Prime Meridian / Equator
+const isValidCoordinate = (pos: [number, number] | null | undefined): pos is [number, number] => {
+  if (!pos || !Array.isArray(pos) || pos.length < 2) return false;
+  const [lat, lng] = pos;
+  if (typeof lat !== 'number' || typeof lng !== 'number' || isNaN(lat) || isNaN(lng)) return false;
+  if (Math.abs(lat) < 0.0001 && Math.abs(lng) < 0.0001) return false;
+  return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+};
+
 // Custom Leaflet TileLayer with IndexedDB Offline Persistence Interceptor
 const IndexedDBTileLayer = L.TileLayer.extend({
   createTile(coords: L.Coords, done: L.DoneCallback) {
@@ -158,6 +167,12 @@ export interface MapViewProps {
   cameraMode?: 'north-up' | 'head-up';
   isDarkMode?: boolean;
   hideControls?: boolean;
+  gnssBadge?: {
+    label: string;
+    dotColor: string;
+    badgeBg: string;
+    title: string;
+  };
   onMapClick?: (lat: number, lng: number) => void;
   onStartDragEnd?: (lat: number, lng: number) => void;
   onDestinationDragEnd?: (lat: number, lng: number) => void;
@@ -184,6 +199,7 @@ const MapViewComponent: React.FC<MapViewProps> = ({
   cameraMode = 'north-up',
   isDarkMode = false,
   hideControls = false,
+  gnssBadge,
   onMapClick,
   onStartDragEnd,
   onDestinationDragEnd,
@@ -208,9 +224,12 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     }
   }, [vehicleType]);
 
+  const validLivePos = isValidCoordinate(liveVehiclePos) ? liveVehiclePos : null;
+  const validStartPos = isValidCoordinate(startCoords) ? startCoords : null;
+
   // High-Rate 60 FPS Visual Animation References
-  const targetPosRef = useRef<[number, number] | null>(liveVehiclePos || startCoords);
-  const visualPosRef = useRef<[number, number] | null>(liveVehiclePos || startCoords);
+  const targetPosRef = useRef<[number, number] | null>(validLivePos || validStartPos);
+  const visualPosRef = useRef<[number, number] | null>(validLivePos || validStartPos);
   const targetHeadingRef = useRef<number>(liveHeading || 0);
   const visualHeadingRef = useRef<number>(liveHeading || 0);
   const cameraModeRef = useRef<'north-up' | 'head-up'>(cameraMode);
@@ -234,14 +253,16 @@ const MapViewComponent: React.FC<MapViewProps> = ({
 
   // Keep targetPosRef updated without triggering map camera updates
   useEffect(() => {
-    if (liveVehiclePos) {
-      targetPosRef.current = liveVehiclePos;
-      if (!visualPosRef.current) {
-        visualPosRef.current = [...liveVehiclePos];
+    const validLive = isValidCoordinate(liveVehiclePos) ? liveVehiclePos : null;
+    const validStart = isValidCoordinate(startCoords) ? startCoords : null;
+    if (validLive) {
+      targetPosRef.current = validLive;
+      if (!visualPosRef.current || !isValidCoordinate(visualPosRef.current)) {
+        visualPosRef.current = [...validLive];
       }
-    } else if (startCoords && !visualPosRef.current) {
-      targetPosRef.current = startCoords;
-      visualPosRef.current = [...startCoords];
+    } else if (validStart && (!visualPosRef.current || !isValidCoordinate(visualPosRef.current))) {
+      targetPosRef.current = validStart;
+      visualPosRef.current = [...validStart];
     }
   }, [liveVehiclePos, startCoords]);
 
@@ -254,7 +275,9 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     if (!mapContainerRef.current) return;
     if (mapInstanceRef.current) return;
 
-    const initialCenter = startCoords || liveVehiclePos || center;
+    const initialCenter = (isValidCoordinate(startCoords) ? startCoords : null) ||
+      (isValidCoordinate(liveVehiclePos) ? liveVehiclePos : null) ||
+      center;
 
     const map = L.map(mapContainerRef.current, {
       center: initialCenter,
@@ -292,14 +315,21 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     map.on('movestart', handleUserMapInteraction);
 
     // ResizeObserver to ensure tiles render cleanly without container clipping
+    let resizeAnimFrame: number | null = null;
     const resizeObserver = new ResizeObserver(() => {
-      map.invalidateSize();
+      if (resizeAnimFrame) cancelAnimationFrame(resizeAnimFrame);
+      resizeAnimFrame = requestAnimationFrame(() => {
+        if (mapInstanceRef.current) {
+          mapInstanceRef.current.invalidateSize();
+        }
+      });
     });
     if (mapContainerRef.current) {
       resizeObserver.observe(mapContainerRef.current);
     }
 
     return () => {
+      if (resizeAnimFrame) cancelAnimationFrame(resizeAnimFrame);
       resizeObserver.disconnect();
       if (mapInstanceRef.current) {
         mapInstanceRef.current.remove();
@@ -317,7 +347,8 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     const map = mapInstanceRef.current;
     if (!map || isInitialCenterDoneRef.current) return;
 
-    const initialPos = startCoords || liveVehiclePos;
+    const initialPos = (isValidCoordinate(startCoords) ? startCoords : null) ||
+      (isValidCoordinate(liveVehiclePos) ? liveVehiclePos : null);
     if (initialPos) {
       isProgrammaticMoveRef.current = true;
       map.setView(initialPos, zoom, { animate: false });
@@ -360,8 +391,8 @@ const MapViewComponent: React.FC<MapViewProps> = ({
       const map = mapInstanceRef.current;
       const marker = vehicleMarkerRef.current;
 
-      if (targetPos) {
-        if (!visualPosRef.current) {
+      if (targetPos && isValidCoordinate(targetPos)) {
+        if (!visualPosRef.current || !isValidCoordinate(visualPosRef.current)) {
           visualPosRef.current = [targetPos[0], targetPos[1]];
         } else {
           // Smooth exponential LERP factor for position
@@ -378,28 +409,30 @@ const MapViewComponent: React.FC<MapViewProps> = ({
         const vHead = visualHeadingRef.current;
 
         // Update vehicle marker imperatively (DOES NOT MOVE CAMERA)
-        if (marker) {
-          marker.setLatLng(vPos);
-          const el = marker.getElement();
-          const arrow = el?.querySelector('.chevron-arrow') as HTMLElement;
-          if (arrow) {
-            arrow.style.transform = `rotate(${vHead}deg)`;
+        if (isValidCoordinate(vPos)) {
+          if (marker) {
+            marker.setLatLng(vPos);
+            const el = marker.getElement();
+            const arrow = el?.querySelector('.chevron-arrow') as HTMLElement;
+            if (arrow) {
+              arrow.style.transform = `rotate(${vHead}deg)`;
+            }
+          } else if (markerLayerGroupRef.current) {
+            const newMarker = L.marker(vPos, {
+              icon: createChevronIcon(vHead, vehicleTypeRef.current || 'car'),
+              zIndexOffset: 1000,
+            }).addTo(markerLayerGroupRef.current);
+            vehicleMarkerRef.current = newMarker;
           }
-        } else if (markerLayerGroupRef.current) {
-          const newMarker = L.marker(vPos, {
-            icon: createChevronIcon(vHead, vehicleTypeRef.current || 'car'),
-            zIndexOffset: 1000,
-          }).addTo(markerLayerGroupRef.current);
-          vehicleMarkerRef.current = newMarker;
-        }
 
-        // ONLY glide camera if Follow Mode is explicitly ON (e.g. active navigation)
-        if (
-          followModeRef.current &&
-          map &&
-          !isProgrammaticMoveRef.current
-        ) {
-          map.panTo(vPos, { animate: false });
+          // ONLY glide camera if Follow Mode is explicitly ON (e.g. active navigation)
+          if (
+            followModeRef.current &&
+            map &&
+            !isProgrammaticMoveRef.current
+          ) {
+            map.panTo(vPos, { animate: false });
+          }
         }
 
         // Head-Up Camera Rotation if enabled
@@ -641,7 +674,7 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     (window as any).__mapZoomOut = handleZoomOut;
     (window as any).__mapRecenter = handleRecenterOnLocation;
     (window as any).__mapViewFullRoute = handleShowEntireRoute;
-  });
+  }, [handleZoomIn, handleZoomOut, handleRecenterOnLocation, handleShowEntireRoute]);
 
   return (
     <div className="relative w-full h-full overflow-hidden bg-slate-100 touch-pan-x touch-pan-y">
@@ -705,22 +738,35 @@ const MapViewComponent: React.FC<MapViewProps> = ({
         </div>
       )}
 
-      {/* Floating Camera Mode Quick Toggle in Navigation */}
-      {mode === 'navigation' && onToggleCameraMode && (
-        <div className="absolute left-3 top-16 z-20 flex flex-col gap-1.5">
-          <button
-            onClick={onToggleCameraMode}
-            className="bg-white/95 backdrop-blur-xs border border-slate-200 shadow-md px-2.5 py-1.5 rounded-full flex items-center gap-1.5 text-xs font-bold text-slate-800 hover:bg-slate-50 transition-all active:scale-95 cursor-pointer"
-            title="Toggle Camera Orientation Mode"
-          >
-            <div className="w-2 h-2 rounded-full bg-blue-600 animate-pulse" />
-            <span>{cameraMode === 'north-up' ? 'North-Up' : 'Head-Up (Follow)'}</span>
-          </button>
+      {/* Floating Camera Mode Quick Toggle & GNSS Quality Status Badge in Navigation */}
+      {mode === 'navigation' && (onToggleCameraMode || gnssBadge) && (
+        <div className="absolute left-3 top-16 z-20 flex flex-col gap-1.5 pointer-events-none">
+          {/* GNSS / IDR Real-Time Quality Status Pill */}
+          {gnssBadge && (
+            <div
+              className={`pointer-events-auto backdrop-blur-xs border shadow-md px-2.5 py-1.5 rounded-full flex items-center gap-1.5 text-xs font-bold transition-all ${gnssBadge.badgeBg}`}
+              title={gnssBadge.title}
+            >
+              <div className={`w-2 h-2 rounded-full ${gnssBadge.dotColor}`} />
+              <span className="font-mono">{gnssBadge.label}</span>
+            </div>
+          )}
+
+          {onToggleCameraMode && (
+            <button
+              onClick={onToggleCameraMode}
+              className="pointer-events-auto bg-white/95 backdrop-blur-xs border border-slate-200 shadow-md px-2.5 py-1.5 rounded-full flex items-center gap-1.5 text-xs font-bold text-slate-800 hover:bg-slate-50 transition-all active:scale-95 cursor-pointer"
+              title="Toggle Camera Orientation Mode"
+            >
+              <div className="w-2 h-2 rounded-full bg-blue-600 animate-pulse" />
+              <span>{cameraMode === 'north-up' ? 'North-Up' : 'Head-Up (Follow)'}</span>
+            </button>
+          )}
 
           {!isFollowMode && (
             <button
               onClick={handleRecenterOnLocation}
-              className="bg-amber-500 text-white shadow-md px-2.5 py-1 rounded-full text-[10px] font-extrabold flex items-center gap-1 hover:bg-amber-600 transition-all active:scale-95 cursor-pointer"
+              className="pointer-events-auto bg-amber-500 text-white shadow-md px-2.5 py-1 rounded-full text-[10px] font-extrabold flex items-center gap-1 hover:bg-amber-600 transition-all active:scale-95 cursor-pointer"
               title="Map is in free pan mode. Tap to re-center on vehicle."
             >
               <span>Free Pan • Tap to Follow</span>

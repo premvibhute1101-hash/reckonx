@@ -113,11 +113,25 @@ export const SensorService = {
     if (!SensorService.hasMotionSupport()) return () => {};
 
     const handler = (event: DeviceMotionEvent) => {
-      // 1. Accelerometer: Prefer linear acceleration, fallback to acceleration with gravity
-      const accel = event.acceleration || event.accelerationIncludingGravity;
-      const ax = accel?.x != null ? accel.x : 0;
-      const ay = accel?.y != null ? accel.y : 0;
-      const az = accel?.z != null ? accel.z : 0;
+      // 1. Accelerometer: Prefer accelerationIncludingGravity for raw IMU specific force (standard INS input),
+      // fallback to linear acceleration + gravity baseline.
+      const raw = event.accelerationIncludingGravity;
+      const lin = event.acceleration;
+
+      let ax = 0;
+      let ay = 0;
+      let az = 9.81;
+
+      if (raw && raw.z != null && !isNaN(raw.z)) {
+        ax = raw.x != null ? raw.x : 0;
+        ay = raw.y != null ? raw.y : 0;
+        az = raw.z != null ? raw.z : 9.81;
+      } else if (lin && lin.z != null && !isNaN(lin.z)) {
+        ax = lin.x != null ? lin.x : 0;
+        ay = lin.y != null ? lin.y : 0;
+        az = (lin.z != null ? lin.z : 0) + 9.81;
+      }
+
       const accelMag = Math.sqrt(ax * ax + ay * ay + az * az);
 
       // 2. Gyroscope: rotationRate around x (beta), y (gamma), z (alpha)
