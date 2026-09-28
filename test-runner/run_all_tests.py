@@ -68,7 +68,7 @@ def run_python_suite(name: str, script_path: str, category: str):
     print(f"   Result: {status_icon} ({duration_s:.3f}s)")
 
 
-def run_node_ts_suite(name: str, script_path: str, category: str):
+def run_node_ts_suite(name: str, script_path: str, category: str, cwd: str = ROOT_DIR):
     print(f"\n>> Running [{category}] {name}...")
     start_time = time.time()
     # Execute with npx tsx
@@ -76,7 +76,7 @@ def run_node_ts_suite(name: str, script_path: str, category: str):
     res = subprocess.run(
         cmd,
         shell=True,
-        cwd=os.path.join(ROOT_DIR, "backend"),
+        cwd=cwd,
         capture_output=True,
         text=True
     )
@@ -85,7 +85,7 @@ def run_node_ts_suite(name: str, script_path: str, category: str):
 
     output_lines = (res.stdout + "\n" + res.stderr).strip().splitlines()
     for line in output_lines:
-        if line.startswith("  [PASS]") or line.startswith("  [FAIL]") or "Passed" in line:
+        if line.startswith("  [PASS]") or line.startswith("  [FAIL]") or "Passed" in line or line.startswith("✓") or line.startswith("✗"):
             print(f"   {line}")
 
     test_suites_summary.append({
@@ -242,10 +242,65 @@ def main():
     run_node_ts_suite(
         name="Fastify REST API & Database (Sessions CRUD, Batch Telemetry, Route Fallbacks)",
         script_path=os.path.join(ROOT_DIR, "backend", "src", "test_api_integration.ts"),
-        category="Integration Tests"
+        category="Integration Tests",
+        cwd=os.path.join(ROOT_DIR, "backend")
     )
 
-    # 4. Level 3: End-to-End Mission Pipeline Test
+    # 4. Level 2: EKF & IMU Corroboration / ZUPT Gate Verification
+    run_node_ts_suite(
+        name="Stationary Multipath Rejection & Corroborated ZUPT Gate (6 Verification Cases)",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_stationary_multipath.ts"),
+        category="EKF Verification"
+    )
+
+    # 5. Level 2: Vehicle Dynamic Profile Verification
+    run_node_ts_suite(
+        name="Vehicle Profile Dynamics (Stop, 60 km/h Accel, Smooth Cruise, Decel)",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_vehicle_profile.ts"),
+        category="EKF Verification"
+    )
+
+    # 6. Level 2: Vehicle Tunnel GPS Outage Dead Reckoning
+    run_node_ts_suite(
+        name="Vehicle GPS Outage IDR Hold (60 km/h Tunnel Outage, Drift < 1.0m)",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_vehicle_gps_outage.ts"),
+        category="EKF Verification"
+    )
+
+    # 7. Level 2: Pedestrian Walking & Leveling Dynamics
+    run_node_ts_suite(
+        name="Brisk Walk Heading & 90-Degree Turn (Continuous Leveling, Zero Lateral Bias)",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_brisk_walk_heading.ts"),
+        category="EKF Verification"
+    )
+
+    # 8. Level 2: Moving Multi-Segment Telemetry Session
+    run_node_ts_suite(
+        name="Full Moving Multi-Segment Session Verification",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_moving_session.ts"),
+        category="EKF Verification"
+    )
+
+    # 9. Level 2: Road Network Map Matching Suites
+    run_node_ts_suite(
+        name="Map Matcher Geometric Projection Engine",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_map_matcher.ts"),
+        category="Map Matcher Verification"
+    )
+
+    run_node_ts_suite(
+        name="HMM Viterbi Map Matcher (T-Junction, Parallel Road Drift, Outage Drift)",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_map_matcher_viterbi.ts"),
+        category="Map Matcher Verification"
+    )
+
+    run_node_ts_suite(
+        name="Real Telemetry CSV Map Matching Benchmark",
+        script_path=os.path.join(ROOT_DIR, "test-runner", "verify_real_csv_map_matching.ts"),
+        category="Map Matcher Verification"
+    )
+
+    # 10. Level 3: End-to-End Mission Pipeline Test
     run_python_suite(
         name="Full Mission End-to-End Pipeline (Sensor -> INS -> AI -> 15-State EKF -> HMM Map Matching)",
         script_path=os.path.join(ROOT_DIR, "test-runner", "e2e_full_pipeline_test.py"),

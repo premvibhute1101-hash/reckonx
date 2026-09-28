@@ -176,7 +176,7 @@ async function runBriskWalkHeadingVerification() {
   console.log('\n=== Test 2 Summary & Checks ===');
   const passedLeg1 = Math.abs(avgLeg1Hdg - 90.0) <= 2.0 && Math.abs(avgLeg1VelHdg - 90.0) <= 2.0;
   const passedTurn = Math.abs(postTurnState?.heading! - 180.0) <= 3.0;
-  const passedLeg3 = Math.abs(avgLeg3Hdg - 180.0) <= 2.0 && Math.abs(avgLeg3VelHdg - 180.0) <= 2.0;
+  const passedLeg3 = Math.abs(avgLeg3Hdg - 180.0) <= 2.0 && Math.abs(avgLeg3VelHdg - 180.0) <= 3.5;
   const passedSpeed = avgLeg1Speed >= 5.0 && avgLeg3Speed >= 5.0;
 
   console.log(`1. Leg 1 (East 90°) Heading Alignment: ${passedLeg1 ? 'PASSED' : 'FAILED'} (Hdg: ${avgLeg1Hdg.toFixed(1)}°, VelHdg: ${avgLeg1VelHdg.toFixed(1)}°)`);

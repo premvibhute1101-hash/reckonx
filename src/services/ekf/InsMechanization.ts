@@ -121,23 +121,29 @@ export class InsMechanization {
     this.attitude.yaw += gyro.z * dt;
 
     // 2. Dynamic Gravity Leveling / Continuous Tilt Correction
-    // When the phone is tilted (or stationary), the accelerometer measures the true gravity vector.
-    // Driving estimated roll/pitch toward the accelerometer gravity vector eliminates gravity leakage
-    // into horizontal velocity during small handheld tilts or static inclination.
+    // When stationary or in quasi-steady motion without horizontal acceleration,
+    // drive estimated roll/pitch toward the accelerometer gravity vector.
+    // Suppressed when horizontal acceleration is present (e.g. vehicle accel/braking or walking strides > 0.15 m/s^2)
     const accelMag = Math.sqrt(fAccel.x * fAccel.x + fAccel.y * fAccel.y + fAccel.z * fAccel.z);
     const gravityDiff = Math.abs(accelMag - this.gravity);
 
-    if (gravityDiff < 2.5) {
-      const rollAcc = Math.atan2(fAccel.y, fAccel.z);
-      const pitchAcc = Math.atan2(-fAccel.x, Math.sqrt(fAccel.y * fAccel.y + fAccel.z * fAccel.z));
+    const rollAcc = Math.atan2(fAccel.y, fAccel.z);
+    const pitchAcc = Math.atan2(-fAccel.x, Math.sqrt(fAccel.y * fAccel.y + fAccel.z * fAccel.z));
 
-      // Dynamic gain: rapid convergence (~5.0 rad/s) when near 1g, gently tapering during high linear dynamic loads
-      const gainWeight = Math.max(0, 1 - gravityDiff / 2.5);
-      const alpha = Math.min(1.0, 5.0 * gainWeight * dt);
+    // Pitch leveling: Lateral acceleration (fAccel.x) has zero mean during forward travel,
+    // so pitch is continuously leveled against gyro integration drift
+    const alphaPitch = Math.min(0.2, 0.4 * dt);
+    newPitch = newPitch + alphaPitch * (pitchAcc - newPitch);
 
-      newRoll = newRoll + alpha * (rollAcc - newRoll);
-      newPitch = newPitch + alpha * (pitchAcc - newPitch);
+    // Roll leveling: Forward body acceleration (fAccel.y) can be sustained during vehicle maneuvers,
+    // so roll is gated on |fAccel.y| to prevent vehicle acceleration from being interpreted as tilt
+    let alphaRoll = 0.02 * dt;
+    if (Math.abs(fAccel.y) < 0.08 && gravityDiff < 0.3) {
+      const gainWeight = Math.max(0, 1 - (Math.abs(fAccel.y) / 0.08)) * Math.max(0, 1 - (gravityDiff / 0.3));
+      alphaRoll += 0.78 * gainWeight * dt;
     }
+    alphaRoll = Math.min(0.2, alphaRoll);
+    newRoll = newRoll + alphaRoll * (rollAcc - newRoll);
 
     this.attitude.roll = newRoll;
     this.attitude.pitch = newPitch;
@@ -178,12 +184,7 @@ export class InsMechanization {
     // 4. Subtract gravity (assuming Z is up in ENU)
     const a_n_z_no_g = a_n_z - this.gravity;
 
-    // 5. Horizontal acceleration deadband to eliminate sub-threshold micro-jitter (< 0.12 m/s²)
-    const HORIZONTAL_ACCEL_DEADBAND = 0.12;
-    if (Math.abs(a_n_x) < HORIZONTAL_ACCEL_DEADBAND) a_n_x = 0;
-    if (Math.abs(a_n_y) < HORIZONTAL_ACCEL_DEADBAND) a_n_y = 0;
-
-    // 6. Integrate acceleration into velocity
+    // 5. Integrate acceleration into velocity
     this.velocity.x += a_n_x * dt;
     this.velocity.y += a_n_y * dt;
     this.velocity.z += a_n_z_no_g * dt;
@@ -192,5 +193,13 @@ export class InsMechanization {
     this.position.x += this.velocity.x * dt;
     this.position.y += this.velocity.y * dt;
     this.position.z += this.velocity.z * dt;
+  }
+
+  public getLastNavAccel(): { x: number; y: number; z: number } {
+    return {
+      x: this.lastSpecificForce ? this.lastSpecificForce.x : 0,
+      y: this.lastSpecificForce ? this.lastSpecificForce.y : 0,
+      z: this.lastSpecificForce ? this.lastSpecificForce.z - this.gravity : 0,
+    };
   }
 }

@@ -33,13 +33,15 @@ async function runVehicleGpsOutageVerification() {
   console.log('--- Step 1: Cruising at 60 km/h with Good GNSS (5 seconds) ---');
   for (let t = 0; t < 5.0; t += dtSec) {
     currentTimeMs += dtMs;
-    const distStep = cruiseSpeedMps * dtSec;
+    const accelAy = t < 1.5 ? (cruiseSpeedMps / 1.5) : 0;
+    const currentSpeed = Math.min(cruiseSpeedMps, (t / 1.5) * cruiseSpeedMps);
+    const distStep = currentSpeed * dtSec;
     currentLat += (distStep / 111320); // Moving North
 
-    // Real highway road vibration: small oscillations in accel and gyro
+    // Real highway road vibration: small oscillations in accel and gyro plus initial vehicle acceleration
     const angle = t * 25.0;
     const vibAx = 0.3 * Math.sin(angle);
-    const vibAy = 0.35 * Math.cos(angle * 1.2);
+    const vibAy = accelAy + 0.35 * Math.cos(angle * 1.2);
     const vibAz = 9.81 + 0.3 * Math.sin(angle * 1.8);
     const vibGx = 0.04 * Math.sin(angle * 0.8);
     const vibGy = 0.04 * Math.cos(angle * 1.4);
@@ -56,7 +58,7 @@ async function runVehicleGpsOutageVerification() {
         latitude: currentLat,
         longitude: currentLon,
         accuracy: 4.0,
-        speed: cruiseSpeedMps,
+        speed: currentSpeed,
         heading: 0,
         timestamp: currentTimeMs,
       });

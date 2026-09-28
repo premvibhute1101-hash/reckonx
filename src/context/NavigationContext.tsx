@@ -22,6 +22,8 @@ import { SensorService } from '../services/sensorService';
 import { TileCacheService } from '../services/tileCacheService';
 import { LogExportService } from '../services/logExportService';
 import { AIErrorCorrectionService } from '../services/AIErrorCorrectionService';
+import { RoadGraphCacheService } from '../services/roadGraphCacheService';
+import { haversineDistance } from '../services/ekf/OutputStabilizer';
 import { backendService, type BackendConnectionStatus } from '../services/BackendService';
 import { fusionRuntime } from '../services/ekf';
 import type { FusedState } from '../services/ekf';
@@ -188,6 +190,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [trackingSession, setTrackingSession] = useState<ActiveTrackingSession>(initialTrackingSession);
   const [fusedState, setFusedState] = useState<FusedState | null>(null);
 
+  // Background Road Graph Pre-fetch Tracker
+  const lastRoadGraphPrefetchPosRef = useRef<{ lat: number; lng: number } | null>(null);
+  const lastRoadGraphPrefetchTimeRef = useRef<number>(0);
+
   // EKF Fusion Runtime Lifecycle
   useEffect(() => {
     fusionRuntime.setOnFusedDataCallback((state) => {
@@ -202,6 +208,46 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           ...prev,
           speed: cleanSpeed,
         }));
+      }
+
+      // Pre-fetch road graph cells for current position + 8 neighbors when GNSS is active and online
+      if (
+        state.sourceMode === 'GNSS' &&
+        state.latitude !== null &&
+        state.longitude !== null &&
+        (typeof navigator === 'undefined' || navigator.onLine)
+      ) {
+        const now = Date.now();
+        const curLat = state.latitude;
+        const curLng = state.longitude;
+
+        if (!lastRoadGraphPrefetchPosRef.current) {
+          lastRoadGraphPrefetchPosRef.current = { lat: curLat, lng: curLng };
+          lastRoadGraphPrefetchTimeRef.current = now;
+          RoadGraphCacheService.prefetchRegion(curLat, curLng).catch((err) => {
+            console.warn('[RoadGraphCache] Background prefetch error:', err);
+          });
+        } else {
+          const distMeters = haversineDistance(
+            lastRoadGraphPrefetchPosRef.current.lat,
+            lastRoadGraphPrefetchPosRef.current.lng,
+            curLat,
+            curLng
+          );
+          const timeElapsedMs = now - lastRoadGraphPrefetchTimeRef.current;
+          const speed = state.velocity
+            ? Math.sqrt(state.velocity.x * state.velocity.x + state.velocity.y * state.velocity.y)
+            : 0;
+
+          // Trigger on ~500m traveled or ~30s elapsed with active movement (>0.5 m/s)
+          if (distMeters >= 500 || (timeElapsedMs >= 30000 && speed > 0.5 && distMeters >= 30)) {
+            lastRoadGraphPrefetchPosRef.current = { lat: curLat, lng: curLng };
+            lastRoadGraphPrefetchTimeRef.current = now;
+            RoadGraphCacheService.prefetchRegion(curLat, curLng).catch((err) => {
+              console.warn('[RoadGraphCache] Background prefetch error:', err);
+            });
+          }
+        }
       }
     });
     fusionRuntime.start();
@@ -1165,8 +1211,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     });
   }, []);
 
-  const exportCurrentSessionLogs = useCallback(() => {
-    const result = LogExportService.exportSessionToCSV(trackingSession.points, {
+  const exportCurrentSessionLogs = useCallback(async () => {
+    showToast('Processing map matching & generating CSV...');
+    const result = await LogExportService.exportSessionToCSV(trackingSession.points, {
       origin: routeState.origin,
       destination: routeState.destination,
       startTime: trackingSession.startTime || undefined,

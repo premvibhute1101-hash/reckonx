@@ -12,7 +12,7 @@ function distanceKm(p1: [number, number], p2: [number, number]): number {
  * Calculate the projection of a point onto a line segment [p1, p2].
  * Returns the nearest coordinate on the segment.
  */
-function projectPointOnSegment(
+export function projectPointOnSegment(
   p: [number, number],
   p1: [number, number],
   p2: [number, number]

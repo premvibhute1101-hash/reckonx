@@ -289,6 +289,6 @@ export interface NavigationContextType {
   startTrackingSession: () => void;
   stopTrackingSession: () => void;
   recordSessionPoint: (point: RecordedGPSPoint) => void;
-  exportCurrentSessionLogs: () => { success: boolean; message: string };
+  exportCurrentSessionLogs: () => Promise<{ success: boolean; message: string; filename?: string }>;
   resetSensorZeroPoint: () => void;
 }

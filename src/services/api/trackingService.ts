@@ -25,6 +25,26 @@ export interface RecordedGPSPoint {
   gpsGroundTruthLat?: number;
   /** GPS ground-truth lng at this point (same as lng for GNSS points). */
   gpsGroundTruthLng?: number;
+  /** Offline HMM map-matched latitude (batch post-processed). */
+  matchedLat?: number | null;
+  /** Offline HMM map-matched longitude (batch post-processed). */
+  matchedLng?: number | null;
+  // IMU & ZUPT motion corroboration diagnostic columns
+  imuVarA?: number;
+  imuVarG?: number;
+  gnssSpeedRawKmH?: number;
+  gnssAccuracyRaw?: number | null;
+  zuptState?: 'LOCKED' | 'RELEASED';
+  gnssRejected?: boolean;
+  gnssUncorroborated?: boolean;
+  // Raw geolocation callback diagnostics
+  rawCbLatitude?: number | null;
+  rawCbLongitude?: number | null;
+  rawCbAccuracy?: number | null;
+  rawCbSpeedMps?: number | null;
+  rawCbHeading?: number | null;
+  rawCbTimestamp?: number | null;
+  gnssAppliedThisTick?: boolean;
 }
 
 

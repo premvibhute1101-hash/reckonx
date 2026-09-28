@@ -1,4 +1,5 @@
 import type { RecordedGPSPoint } from './api/trackingService';
+import { MapMatchingService } from './MapMatchingService';
 
 export interface TelemetryLogEntry {
   timestamp: number;
@@ -17,12 +18,74 @@ export interface TelemetryLogEntry {
   yaw?: number;
 }
 
+/**
+ * Post-processes dead-reckoning spans with offline HMM map matching.
+ */
+async function processMapMatching(points: RecordedGPSPoint[]): Promise<RecordedGPSPoint[]> {
+  const processedPoints = points.map((p) => ({ ...p }));
+  const n = processedPoints.length;
+  if (n === 0) return processedPoints;
+
+  // Partition points into contiguous isDeadReckoning === true spans
+  let spanStart: number | null = null;
+  const spans: { start: number; end: number }[] = [];
+
+  for (let i = 0; i < n; i++) {
+    if (processedPoints[i].isDeadReckoning) {
+      if (spanStart === null) spanStart = i;
+    } else {
+      if (spanStart !== null) {
+        spans.push({ start: spanStart, end: i - 1 });
+        spanStart = null;
+      }
+    }
+  }
+  if (spanStart !== null) {
+    spans.push({ start: spanStart, end: n - 1 });
+  }
+
+  for (const span of spans) {
+    // Include bounding GNSS anchor points as context if available
+    const hasBeforeAnchor = span.start > 0 && !processedPoints[span.start - 1].isDeadReckoning;
+    const hasAfterAnchor = span.end < n - 1 && !processedPoints[span.end + 1].isDeadReckoning;
+
+    const segmentToMatch: RecordedGPSPoint[] = [];
+    if (hasBeforeAnchor) {
+      segmentToMatch.push(processedPoints[span.start - 1]);
+    }
+    for (let i = span.start; i <= span.end; i++) {
+      segmentToMatch.push(processedPoints[i]);
+    }
+    if (hasAfterAnchor) {
+      segmentToMatch.push(processedPoints[span.end + 1]);
+    }
+
+    try {
+      const matchResult = await MapMatchingService.matchSegment(segmentToMatch);
+      if (matchResult.matched && matchResult.points && matchResult.points.length === segmentToMatch.length) {
+        const offset = hasBeforeAnchor ? 1 : 0;
+        for (let i = span.start; i <= span.end; i++) {
+          const matchedPt = matchResult.points[offset + (i - span.start)];
+          if (matchedPt) {
+            processedPoints[i].matchedLat = matchedPt.lat;
+            processedPoints[i].matchedLng = matchedPt.lng;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[LogExportService] Map matching error for span:', err);
+    }
+  }
+
+  return processedPoints;
+}
+
 export const LogExportService = {
   /**
-   * Generates and triggers download of a genuine CSV file from real collected telemetry & tracking data.
-   * Returns false if there is no data to export.
+   * Post-processes DR spans with offline HMM map matching and triggers download
+   * of a genuine CSV file from real collected telemetry & tracking data.
    */
-  exportSessionToCSV(
+  async exportSessionToCSV(
     points: RecordedGPSPoint[],
     sessionMetadata?: {
       origin?: string;
@@ -31,13 +94,16 @@ export const LogExportService = {
       endTime?: number;
       totalDistanceKm?: number;
     }
-  ): { success: boolean; message: string; filename?: string } {
+  ): Promise<{ success: boolean; message: string; filename?: string }> {
     if (!points || points.length === 0) {
       return {
         success: false,
         message: 'No data available for export. Start a live navigation session to collect telemetry.',
       };
     }
+
+    // Run offline HMM map-matching on DR spans
+    const finalPoints = await processMapMatching(points);
 
     const rows: string[] = [];
 
@@ -49,7 +115,7 @@ export const LogExportService = {
       if (sessionMetadata.startTime) rows.push(`# Session Start: ${new Date(sessionMetadata.startTime).toISOString()}`);
     }
 
-    // CSV Header row
+    // CSV Header row — Matched_Latitude and Matched_Longitude strictly appended at the end
     const headers = [
       'Timestamp_Epoch_Ms',
       'Time_ISO',
@@ -61,6 +127,22 @@ export const LogExportService = {
       'Heading_Deg',
       'Altitude_Meters',
       'Is_Dead_Reckoning',
+      // IMU & Motion Corroboration Diagnostics
+      'IMU_VarA',
+      'IMU_VarG',
+      'GNSS_Speed_Raw_KmH',
+      'GNSS_Accuracy_Raw',
+      'ZUPT_State',
+      'Gnss_Rejected',
+      'GNSS_Uncorroborated',
+      // Raw Geolocation Provider Callback Diagnostics
+      'Raw_CB_Latitude',
+      'Raw_CB_Longitude',
+      'Raw_CB_Accuracy',
+      'Raw_CB_Speed_mps',
+      'Raw_CB_Heading',
+      'Raw_CB_Timestamp',
+      'GNSS_Applied_This_Tick',
       // AI Correction columns — populated during DR epochs
       'Raw_DR_VelX_ms',      // Raw INS velocity X (m/s ENU) before AI correction
       'Raw_DR_VelY_ms',      // Raw INS velocity Y (m/s ENU) before AI correction
@@ -70,11 +152,14 @@ export const LogExportService = {
       // GPS ground truth columns (same as lat/lng for GNSS points)
       'GPS_GroundTruth_Lat',
       'GPS_GroundTruth_Lng',
+      // Offline HMM map-matching columns (populated during DR epochs on match success)
+      'Matched_Latitude',
+      'Matched_Longitude',
     ];
 
     rows.push(headers.join(','));
 
-    for (const pt of points) {
+    for (const pt of finalPoints) {
       const row = [
         pt.timestamp,
         new Date(pt.timestamp).toISOString(),
@@ -86,6 +171,22 @@ export const LogExportService = {
         pt.headingDeg !== undefined ? pt.headingDeg.toFixed(1) : '',
         pt.altitudeMeters !== undefined && pt.altitudeMeters !== null ? pt.altitudeMeters.toFixed(1) : '',
         pt.isDeadReckoning ? 'TRUE' : 'FALSE',
+        // IMU & Motion Corroboration Diagnostics
+        pt.imuVarA !== undefined && pt.imuVarA !== null && !isNaN(pt.imuVarA) ? pt.imuVarA.toFixed(6) : '',
+        pt.imuVarG !== undefined && pt.imuVarG !== null && !isNaN(pt.imuVarG) ? pt.imuVarG.toFixed(6) : '',
+        pt.gnssSpeedRawKmH !== undefined && pt.gnssSpeedRawKmH !== null && !isNaN(pt.gnssSpeedRawKmH) ? pt.gnssSpeedRawKmH.toFixed(2) : '',
+        pt.gnssAccuracyRaw !== undefined && pt.gnssAccuracyRaw !== null && !isNaN(pt.gnssAccuracyRaw) ? pt.gnssAccuracyRaw.toFixed(1) : '',
+        pt.zuptState || ((pt.speedKmH || 0) > 0.5 ? 'RELEASED' : 'LOCKED'),
+        pt.gnssRejected ? 'TRUE' : 'FALSE',
+        pt.gnssUncorroborated ? 'TRUE' : 'FALSE',
+        // Raw Geolocation Provider Callback Diagnostics
+        pt.rawCbLatitude !== undefined && pt.rawCbLatitude !== null ? pt.rawCbLatitude.toFixed(6) : '',
+        pt.rawCbLongitude !== undefined && pt.rawCbLongitude !== null ? pt.rawCbLongitude.toFixed(6) : '',
+        pt.rawCbAccuracy !== undefined && pt.rawCbAccuracy !== null ? pt.rawCbAccuracy.toFixed(1) : '',
+        pt.rawCbSpeedMps !== undefined && pt.rawCbSpeedMps !== null ? pt.rawCbSpeedMps.toFixed(2) : '',
+        pt.rawCbHeading !== undefined && pt.rawCbHeading !== null ? pt.rawCbHeading.toFixed(1) : '',
+        pt.rawCbTimestamp !== undefined && pt.rawCbTimestamp !== null ? pt.rawCbTimestamp : '',
+        pt.gnssAppliedThisTick ? 'TRUE' : 'FALSE',
         // AI correction columns
         pt.rawInsVelX !== undefined ? pt.rawInsVelX.toFixed(4) : '',
         pt.rawInsVelY !== undefined ? pt.rawInsVelY.toFixed(4) : '',
@@ -95,10 +196,12 @@ export const LogExportService = {
         // GPS ground truth (for GNSS points, mirrors lat/lng; for DR points, blank)
         pt.gpsGroundTruthLat !== undefined ? pt.gpsGroundTruthLat.toFixed(6) : (!pt.isDeadReckoning && pt.lat !== undefined ? pt.lat.toFixed(6) : ''),
         pt.gpsGroundTruthLng !== undefined ? pt.gpsGroundTruthLng.toFixed(6) : (!pt.isDeadReckoning && pt.lng !== undefined ? pt.lng.toFixed(6) : ''),
+        // Matched coordinates (blank on failure or non-DR)
+        pt.matchedLat !== undefined && pt.matchedLat !== null ? pt.matchedLat.toFixed(6) : '',
+        pt.matchedLng !== undefined && pt.matchedLng !== null ? pt.matchedLng.toFixed(6) : '',
       ];
       rows.push(row.join(','));
     }
-
 
     const csvContent = rows.join('\r\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -118,8 +221,13 @@ export const LogExportService = {
 
     return {
       success: true,
-      message: `Exported ${points.length} genuine telemetry points to ${filename}`,
+      message: `Exported ${finalPoints.length} genuine telemetry points to ${filename}`,
       filename,
     };
   },
+
+  /**
+   * Direct helper for testing / programmatic map-matching pipeline.
+   */
+  processMapMatching,
 };

@@ -472,6 +472,20 @@ export const NavigationHudPage: React.FC = () => {
           aiCorrectedVelX: telemetry.aiCorrectedVelX,
           aiCorrectedVelY: telemetry.aiCorrectedVelY,
           aiConfidence: telemetry.aiConfidence,
+          imuVarA: fusedState.imuVarA,
+          imuVarG: fusedState.imuVarG,
+          gnssSpeedRawKmH: fusedState.gnssSpeedRawKmH,
+          gnssAccuracyRaw: fusedState.gnssAccuracyRaw,
+          zuptState: fusedState.zuptState,
+          gnssRejected: fusedState.gnssRejected,
+          gnssUncorroborated: fusedState.gnssUncorroborated,
+          rawCbLatitude: currentLocation.latitude,
+          rawCbLongitude: currentLocation.longitude,
+          rawCbAccuracy: currentLocation.accuracy,
+          rawCbSpeedMps: currentLocation.speed !== null && currentLocation.speed !== undefined ? currentLocation.speed / 3.6 : null,
+          rawCbHeading: currentLocation.bearing,
+          rawCbTimestamp: currentLocation.timestamp,
+          gnssAppliedThisTick: fusedState.gnssAppliedThisTick,
         });
       }
 
@@ -519,6 +533,13 @@ export const NavigationHudPage: React.FC = () => {
           headingDeg: currentLocation.bearing || liveHeading,
           altitudeMeters: currentLocation.altitude || undefined,
           isDeadReckoning: false,
+          rawCbLatitude: currentLocation.latitude,
+          rawCbLongitude: currentLocation.longitude,
+          rawCbAccuracy: currentLocation.accuracy,
+          rawCbSpeedMps: currentLocation.speed !== null && currentLocation.speed !== undefined ? currentLocation.speed / 3.6 : null,
+          rawCbHeading: currentLocation.bearing,
+          rawCbTimestamp: currentLocation.timestamp,
+          gnssAppliedThisTick: true,
         });
       }
 
@@ -683,6 +704,13 @@ export const NavigationHudPage: React.FC = () => {
             aiCorrectedVelX,
             aiCorrectedVelY,
             aiConfidence,
+            rawCbLatitude: currentLocation.latitude,
+            rawCbLongitude: currentLocation.longitude,
+            rawCbAccuracy: currentLocation.accuracy,
+            rawCbSpeedMps: currentLocation.speed !== null && currentLocation.speed !== undefined ? currentLocation.speed / 3.6 : null,
+            rawCbHeading: currentLocation.bearing,
+            rawCbTimestamp: currentLocation.timestamp,
+            gnssAppliedThisTick: false,
           });
         }
 

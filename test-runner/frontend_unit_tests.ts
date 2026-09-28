@@ -7,9 +7,9 @@
  * - Distance Formatters & Route Progress Calculators
  */
 
-import { InsMechanization } from '../src/core/InsMechanization';
-import { GnssQualityStateMachine } from '../src/core/GnssQualityStateMachine';
-import { OutputStabilizer } from '../src/core/OutputStabilizer';
+import { InsMechanization } from '../src/services/ekf/InsMechanization';
+import { GnssQualityStateMachine } from '../src/services/ekf/GnssQualityStateMachine';
+import { OutputStabilizer } from '../src/services/ekf/OutputStabilizer';
 import { formatKmDistance } from '../src/utils/distanceFormatter';
 import { calculateRemainingRoadDistance } from '../src/utils/routeProgress';
 

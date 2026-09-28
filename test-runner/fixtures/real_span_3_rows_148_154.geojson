@@ -1,0 +1,59 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Real Span 3 - Raw DR Track (Retained Uncorrupted)",
+        "stroke": "#ff0000"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            75.891253,
+            17.639741
+          ],
+          [
+            75.890956,
+            17.639788
+          ],
+          [
+            75.890662,
+            17.639835
+          ],
+          [
+            75.890367,
+            17.639883
+          ],
+          [
+            75.890072,
+            17.63993
+          ],
+          [
+            75.889773,
+            17.639978
+          ],
+          [
+            75.889477,
+            17.640025
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Real Span 3 - Reacquisition GNSS Fix",
+        "marker-color": "#0000ff"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          75.888381,
+          17.640195
+        ]
+      }
+    }
+  ]
+}
