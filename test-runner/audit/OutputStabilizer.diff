@@ -1,0 +1,323 @@
+--- IDR_PRO/src/core/OutputStabilizer.ts
++++ src/services/ekf/OutputStabilizer.ts
+@@ -3,49 +3,57 @@
+ // Haversine formula to calculate distance in meters between two lat/lon points
+ export function haversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+   const R = 6371e3; // Earth radius in meters
+-  const rLat1 = lat1 * Math.PI / 180;
+-  const rLat2 = lat2 * Math.PI / 180;
+-  const dLat = (lat2 - lat1) * Math.PI / 180;
+-  const dLon = (lon2 - lon1) * Math.PI / 180;
+-
+-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+-            Math.cos(rLat1) * Math.cos(rLat2) *
+-            Math.sin(dLon / 2) * Math.sin(dLon / 2);
++  const rLat1 = (lat1 * Math.PI) / 180;
++  const rLat2 = (lat2 * Math.PI) / 180;
++  const dLat = ((lat2 - lat1) * Math.PI) / 180;
++  const dLon = ((lon2 - lon1) * Math.PI) / 180;
++
++  const a =
++    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
++    Math.cos(rLat1) * Math.cos(rLat2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+   return R * c;
+ }
+ 
+ // Calculate bearing from pt1 to pt2
+ export function calculateBearing(lat1: number, lon1: number, lat2: number, lon2: number): number {
+-  const rLat1 = lat1 * Math.PI / 180;
+-  const rLat2 = lat2 * Math.PI / 180;
+-  const dLon = (lon2 - lon1) * Math.PI / 180;
++  const rLat1 = (lat1 * Math.PI) / 180;
++  const rLat2 = (lat2 * Math.PI) / 180;
++  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+ 
+   const y = Math.sin(dLon) * Math.cos(rLat2);
+-  const x = Math.cos(rLat1) * Math.sin(rLat2) -
+-            Math.sin(rLat1) * Math.cos(rLat2) * Math.cos(dLon);
++  const x =
++    Math.cos(rLat1) * Math.sin(rLat2) -
++    Math.sin(rLat1) * Math.cos(rLat2) * Math.cos(dLon);
+   return Math.atan2(y, x);
+ }
+ 
+ // Project a point given distance and bearing
+-export function projectLocation(lat: number, lon: number, distanceMeters: number, bearing: number): { lat: number, lon: number } {
++export function projectLocation(
++  lat: number,
++  lon: number,
++  distanceMeters: number,
++  bearing: number
++): { lat: number; lon: number } {
+   const R = 6371e3;
+-  const rLat = lat * Math.PI / 180;
+-  const rLon = lon * Math.PI / 180;
++  const rLat = (lat * Math.PI) / 180;
++  const rLon = (lon * Math.PI) / 180;
+ 
+   const newLat = Math.asin(
+     Math.sin(rLat) * Math.cos(distanceMeters / R) +
+-    Math.cos(rLat) * Math.sin(distanceMeters / R) * Math.cos(bearing)
++      Math.cos(rLat) * Math.sin(distanceMeters / R) * Math.cos(bearing)
+   );
+ 
+-  const newLon = rLon + Math.atan2(
+-    Math.sin(bearing) * Math.sin(distanceMeters / R) * Math.cos(rLat),
+-    Math.cos(distanceMeters / R) - Math.sin(rLat) * Math.sin(newLat)
+-  );
++  const newLon =
++    rLon +
++    Math.atan2(
++      Math.sin(bearing) * Math.sin(distanceMeters / R) * Math.cos(rLat),
++      Math.cos(distanceMeters / R) - Math.sin(rLat) * Math.sin(newLat)
++    );
+ 
+   return {
+-    lat: newLat * 180 / Math.PI,
+-    lon: newLon * 180 / Math.PI
++    lat: (newLat * 180) / Math.PI,
++    lon: (newLon * 180) / Math.PI,
+   };
+ }
+ 
+@@ -78,20 +86,41 @@
+ }
+ 
+ export class RateLimiter {
++  private config: RateLimiterConfig;
+   private lastSpeed: number = 0;
+ 
+-  constructor(private config: RateLimiterConfig) {}
+-
+-  public filter(input: StabilizerInput, previousAccepted: StabilizerInput | null): { output: StabilizerInput, clampEvent?: any } {
+-    if (!previousAccepted) {
++  constructor(config: RateLimiterConfig) {
++    this.config = config;
++  }
++
++  public reset() {
++    this.lastSpeed = 0;
++  }
++
++  public filter(
++    input: StabilizerInput,
++    previousAccepted: StabilizerInput | null
++  ): { output: StabilizerInput; clampEvent?: any } {
++    // If input is near (0,0) or previous was near (0,0), do not clamp against (0,0)
++    const isZero = (lat: number, lon: number) => Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001;
++
++    if (!previousAccepted || isZero(previousAccepted.lat, previousAccepted.lon) || isZero(input.lat, input.lon)) {
+       this.lastSpeed = 0;
+       return { output: input };
+     }
+ 
+     const dt = (input.timestamp - previousAccepted.timestamp) / 1000.0;
+-    if (dt <= 0) return { output: input }; // Should not happen in causal processing
+-
+-    const distMeters = haversineDistance(previousAccepted.lat, previousAccepted.lon, input.lat, input.lon);
++    if (dt <= 0 || dt > 10.0) {
++      this.lastSpeed = 0;
++      return { output: input };
++    }
++
++    const distMeters = haversineDistance(
++      previousAccepted.lat,
++      previousAccepted.lon,
++      input.lat,
++      input.lon
++    );
+     const impliedSpeed = distMeters / dt;
+     const impliedAccel = Math.abs(impliedSpeed - this.lastSpeed) / dt;
+ 
+@@ -101,21 +130,31 @@
+     if (impliedSpeed > this.config.maxSpeedMps) {
+       clamped = true;
+       allowedSpeed = this.config.maxSpeedMps;
+-    } else if (impliedAccel > this.config.maxAccelMps2) {
++    } else if (dt >= 0.08 && distMeters > 1.0 && impliedAccel > this.config.maxAccelMps2) {
+       clamped = true;
+-      // Limit speed change based on max accel
+-      allowedSpeed = this.lastSpeed + Math.sign(impliedSpeed - this.lastSpeed) * this.config.maxAccelMps2 * dt;
+-      // ensure we don't go negative or exceed max speed
+-      allowedSpeed = Math.max(0, Math.min(allowedSpeed, this.config.maxSpeedMps)); 
++      allowedSpeed =
++        this.lastSpeed +
++        Math.sign(impliedSpeed - this.lastSpeed) * this.config.maxAccelMps2 * dt;
++      allowedSpeed = Math.max(0, Math.min(allowedSpeed, this.config.maxSpeedMps));
+     }
+ 
+     if (clamped) {
+-      const bearing = calculateBearing(previousAccepted.lat, previousAccepted.lon, input.lat, input.lon);
++      const bearing = calculateBearing(
++        previousAccepted.lat,
++        previousAccepted.lon,
++        input.lat,
++        input.lon
++      );
+       const allowedDist = allowedSpeed * dt;
+-      const projected = projectLocation(previousAccepted.lat, previousAccepted.lon, allowedDist, bearing);
+-      
++      const projected = projectLocation(
++        previousAccepted.lat,
++        previousAccepted.lon,
++        allowedDist,
++        bearing
++      );
++
+       this.lastSpeed = allowedSpeed;
+-      
++
+       const clampedInput = { ...input, lat: projected.lat, lon: projected.lon };
+       const clampEvent = {
+         type: 'rate_limit_clamp',
+@@ -123,7 +162,7 @@
+         clampedFix: { lat: projected.lat, lon: projected.lon },
+         impliedSpeed,
+         impliedAccel,
+-        timestamp: input.timestamp
++        timestamp: input.timestamp,
+       };
+ 
+       return { output: clampedInput, clampEvent };
+@@ -149,8 +188,24 @@
+     this.P = Matrix.eye(4).mul(100);
+   }
+ 
++  public reset() {
++    this.isInitialized = false;
++    this.lastTime = 0;
++    this.x = Matrix.zeros(4, 1);
++    this.P = Matrix.eye(4).mul(100);
++  }
++
+   public filter(input: StabilizerInput): StabilizedOutput {
+-    if (!this.isInitialized || this.lastTime === 0 || Math.abs(input.timestamp - this.lastTime) > 10000) {
++    const isZero = (lat: number, lon: number) => Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001;
++    if (isZero(input.lat, input.lon)) {
++      return { lat: input.lat, lon: input.lon, wasClamped: false, wasSmoothed: false };
++    }
++
++    if (
++      !this.isInitialized ||
++      this.lastTime === 0 ||
++      Math.abs(input.timestamp - this.lastTime) > 10000
++    ) {
+       this.x = new Matrix([[input.lat], [input.lon], [0], [0]]);
+       this.P = Matrix.eye(4).mul(1e-9);
+       this.lastTime = input.timestamp;
+@@ -160,7 +215,12 @@
+ 
+     const dt = (input.timestamp - this.lastTime) / 1000.0;
+     if (dt <= 0) {
+-      return { lat: this.x.get(0, 0), lon: this.x.get(1, 0), wasClamped: false, wasSmoothed: true };
++      return {
++        lat: this.x.get(0, 0),
++        lon: this.x.get(1, 0),
++        wasClamped: false,
++        wasSmoothed: true,
++      };
+     }
+     this.lastTime = input.timestamp;
+ 
+@@ -184,14 +244,11 @@
+     H.set(0, 0, 1);
+     H.set(1, 1, 1);
+ 
+-    // R scaling
+-    // ~0.2m variance for GOOD -> ~1e-11 deg^2
+-    let baseR = 1e-10; 
++    let baseR = 1e-10;
+     if (input.gnssState === 'DEGRADED' || input.gnssState === 'WEAK_LOST') {
+-      baseR = 1e-8; // 100x looser when degraded
+-    }
+-
+-    // Apply ekfConfidence if provided (assuming it acts like a multiplier or raw variance)
++      baseR = 1e-8;
++    }
++
+     const R_val = input.ekfConfidence ? baseR * input.ekfConfidence : baseR;
+     const R = Matrix.eye(2).mul(R_val);
+ 
+@@ -199,24 +256,28 @@
+     let S_inv;
+     try {
+       S_inv = mlInverse(S);
+-    } catch (e) {
+-      // Singular matrix fallback
+-      return { lat: this.x.get(0, 0), lon: this.x.get(1, 0), wasClamped: false, wasSmoothed: true };
+-    }
+-    
++    } catch {
++      return {
++        lat: this.x.get(0, 0),
++        lon: this.x.get(1, 0),
++        wasClamped: false,
++        wasSmoothed: true,
++      };
++    }
++
+     const K = this.P.mmul(H.transpose()).mmul(S_inv);
+ 
+-    const y = z.sub(H.mmul(this.x)); // Innovation
++    const y = z.sub(H.mmul(this.x));
+     this.x = this.x.add(K.mmul(y));
+ 
+     const I = Matrix.eye(4);
+     this.P = I.sub(K.mmul(H)).mmul(this.P);
+ 
+-    return { 
+-      lat: this.x.get(0, 0), 
++    return {
++      lat: this.x.get(0, 0),
+       lon: this.x.get(1, 0),
+       wasClamped: false,
+-      wasSmoothed: true
++      wasSmoothed: true,
+     };
+   }
+ }
+@@ -226,26 +287,37 @@
+   private smoother: CvKalmanSmoother;
+   private previousAccepted: StabilizerInput | null = null;
+ 
+-  constructor(rateLimiterConfig: RateLimiterConfig, qPos: number = 1e-9, qVel: number = 1e-5) {
++  constructor(
++    rateLimiterConfig: RateLimiterConfig,
++    qPos: number = 1e-9,
++    qVel: number = 1e-5
++  ) {
+     this.rateLimiter = new RateLimiter(rateLimiterConfig);
+     this.smoother = new CvKalmanSmoother(qPos, qVel);
+   }
+ 
++  public reset() {
++    this.rateLimiter.reset();
++    this.smoother.reset();
++    this.previousAccepted = null;
++  }
++
+   public process(input: StabilizerInput): StabilizedOutput {
+     // 1. Rate Limiting (Clamping)
+-    const { output: limitedInput, clampEvent } = this.rateLimiter.filter(input, this.previousAccepted);
+-    
+-    // Store the limited input for next iteration's rate limiting
++    const { output: limitedInput, clampEvent } = this.rateLimiter.filter(
++      input,
++      this.previousAccepted
++    );
++
+     this.previousAccepted = limitedInput;
+ 
+     // 2. Kalman Smoothing
+     const smoothedOutput = this.smoother.filter(limitedInput);
+ 
+-    // Combine metadata
+     return {
+       ...smoothedOutput,
+       wasClamped: !!clampEvent,
+-      clampEvent: clampEvent as any
++      clampEvent: clampEvent as any,
+     };
+   }
+ }

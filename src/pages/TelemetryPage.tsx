@@ -59,7 +59,7 @@ export const TelemetryPage: React.FC = () => {
 
   return (
     <MobileShell header={header} footer={<BottomNav />}>
-      <div className="flex flex-col space-y-4 p-4 pb-24">
+      <div className="flex flex-col space-y-4 p-4">
         {/* 1. Mode Badge & Sensors Master Toggle */}
         <div className="bg-white border border-slate-200 rounded-lg p-3.5 flex items-center justify-between shadow-xs">
           <div className="space-y-0.5">

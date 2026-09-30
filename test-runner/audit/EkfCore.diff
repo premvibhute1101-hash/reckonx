@@ -1,0 +1,452 @@
+--- IDR_PRO/src/core/EkfCore.ts
++++ src/services/ekf/EkfCore.ts
+@@ -34,7 +34,7 @@
+   // ZUPT state tracking for Q scheduling
+   private wasZuptActive = false;
+   private postZuptCooldown = 0;
+-  private readonly POST_ZUPT_COOLDOWN_CYCLES = 5; // ~0.5s at 10Hz
++  private readonly POST_ZUPT_COOLDOWN_CYCLES = 40; // ~2.0s at 20Hz / 4.0s at 10Hz to safely cover 1Hz GNSS updates
+   private previousVelocity: { x: number; y: number; z: number } | null = null;
+   private lastRawAccel: number[] = [0, 0, 9.81];
+   private lastVelQ: number = 0.01;
+@@ -43,6 +43,7 @@
+   // NHC must NOT fire before this: an identity C_b_n projects full gravity into
+   // navigation-frame lateral/vertical velocity, instantly saturating the ±60 guard.
+   private isAttitudeInitialized = false;
++  private isPositionInitialized = false;
+ 
+   public getIns() {
+     return this.ins;
+@@ -91,14 +92,11 @@
+     const gyrZ = gyro[2] - this.x.get(14, 0);
+ 
+     // 1. Advance INS Mechanization with bias-corrected inputs
+-    const posBefore = { ...this.ins.position };
+     this.ins.predict(
+       dt, 
+       { x: accX, y: accY, z: accZ }, 
+       { x: gyrX, y: gyrY, z: gyrZ }
+     );
+-    // console.log(`[PREDICT] dt=${dt.toFixed(3)}, posBefore: ${posBefore.x.toFixed(3)}, ${posBefore.y.toFixed(3)}, posAfter: ${this.ins.position.x.toFixed(3)}, ${this.ins.position.y.toFixed(3)})`);
+-
+ 
+     // 2. Propagate Covariance P = F * P * F^T + Q
+     const F = Matrix.eye(15);
+@@ -113,12 +111,6 @@
+     const f_n = this.ins.lastSpecificForce;
+ 
+     // Velocity error from Attitude error: -[f^n x] * dt
+-    // [f^n x] = [   0   -f_z   f_y ]
+-    //           [  f_z    0   -f_x ]
+-    //           [ -f_y   f_x    0  ]
+-    // So -[f^n x] = [   0    f_z  -f_y ]
+-    //               [ -f_z    0    f_x ]
+-    //               [  f_y  -f_x    0  ]
+     F.set(3, 6, 0);                 F.set(3, 7, f_n.z * dt);       F.set(3, 8, -f_n.y * dt);
+     F.set(4, 6, -f_n.z * dt);       F.set(4, 7, 0);                F.set(4, 8, f_n.x * dt);
+     F.set(5, 6, f_n.y * dt);        F.set(5, 7, -f_n.x * dt);      F.set(5, 8, 0);
+@@ -143,7 +135,7 @@
+ 
+     // Velocity Q: inflate during post-ZUPT cooldown to allow graceful transition
+     // from pinned-zero covariance to motion-trusting covariance
+-    let velQ = 0.1 * dt;
++    let velQ = 0.25 * dt;
+     if (this.postZuptCooldown > 0) {
+       velQ = 2.0 * dt; // 2x inflation during transition (cooldown)
+       this.postZuptCooldown--;
+@@ -191,6 +183,16 @@
+     this.ins.velocity.y += this.x.get(4, 0);
+     this.ins.velocity.z += this.x.get(5, 0);
+ 
++    // If device is confirmed stationary (ZUPT active), prevent position-error covariance from leaking non-zero velocity
++    if (this.wasZuptActive) {
++      this.ins.velocity.x = 0;
++      this.ins.velocity.y = 0;
++      this.ins.velocity.z = 0;
++      this.x.set(3, 0, 0);
++      this.x.set(4, 0, 0);
++      this.x.set(5, 0, 0);
++    }
++
+     // Clamp attitude error correction to max ~3 degrees (0.05 rad) per update to prevent tilt runaway
+     const maxAttJump = 0.05;
+     const dPitch = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(6, 0)));
+@@ -218,16 +220,15 @@
+     const vel = this.ins.velocity;
+ 
+     // Body-frame velocity components: v^b = (C_b^n)^T * v^n
+-    // Lateral: v_y^b = C_01 * v_x^n + C_11 * v_y^n + C_21 * v_z^n
+-    // Vertical: v_z^b = C_02 * v_x^n + C_12 * v_y^n + C_22 * v_z^n
+-    const v_lat = C_b_n[0][1] * vel.x + C_b_n[1][1] * vel.y + C_b_n[2][1] * vel.z;
++    // Body frame axes: x = lateral (cross-track), y = longitudinal (forward), z = vertical (up)
++    const v_lat = C_b_n[0][0] * vel.x + C_b_n[1][0] * vel.y + C_b_n[2][0] * vel.z;
+     const v_vert = C_b_n[0][2] * vel.x + C_b_n[1][2] * vel.y + C_b_n[2][2] * vel.z;
+ 
+     const H = Matrix.zeros(2, 15);
+-    // Row 0: lateral velocity constraint
+-    H.set(0, 3, C_b_n[0][1]);
+-    H.set(0, 4, C_b_n[1][1]);
+-    H.set(0, 5, C_b_n[2][1]);
++    // Row 0: lateral velocity constraint (body x)
++    H.set(0, 3, C_b_n[0][0]);
++    H.set(0, 4, C_b_n[1][0]);
++    H.set(0, 5, C_b_n[2][0]);
+ 
+     // Row 1: vertical velocity constraint
+     H.set(1, 3, C_b_n[0][2]);
+@@ -249,37 +250,91 @@
+ 
+   private lastGnssPos: number[] | null = null;
+   private lastGnssUpdateTime: number = 0;
++  private lastGnssRejected: boolean = false;
++
++  public isLastGnssRejected(): boolean {
++    return this.lastGnssRejected;
++  }
+ 
+   /**
+    * Update step with GNSS or AI (runs when data is available)
++   * Includes IMU-corroboration gate: when ZUPT is active and GNSS reports motion,
++   * ZUPT is only released if isImuMotionCorroborated or isUncorroboratedEscape is true.
+    */
+-  public updateGnss(gnssPos: number[], gnssVel: number[] | null, accuracy: number | null, recentImuWindow: number[][] = []) {
++  public updateGnss(
++    gnssPos: number[],
++    gnssVel: number[] | null,
++    accuracy: number | null,
++    recentImuWindow: number[][] = [],
++    isImuMotionCorroborated: boolean = true,
++    isUncorroboratedEscape: boolean = false
++  ): boolean {
+     // 1. Determine GNSS Quality
+     const rScale = this.gnssState.updateState(accuracy);
+     const state = this.gnssState.getState();
+ 
++    const gnssReportedSpeed = gnssVel !== null
++      ? Math.sqrt(gnssVel[0] * gnssVel[0] + gnssVel[1] * gnssVel[1] + (gnssVel[2] || 0) * (gnssVel[2] || 0))
++      : 0;
++
++    // Bootstrap Seeding: The very first GNSS fix unconditionally initializes position
++    // regardless of accuracy gating, so the filter has a valid origin to track from.
++    if (!this.isPositionInitialized) {
++      this.ins.position = { x: gnssPos[0], y: gnssPos[1], z: gnssPos[2] };
++      if (gnssVel !== null && gnssReportedSpeed >= 0.4) {
++        this.ins.velocity = { x: gnssVel[0], y: gnssVel[1], z: gnssVel[2] };
++        this.wasZuptActive = false;
++      }
++      this.lastGnssPos = [...gnssPos];
++      this.lastGnssUpdateTime = this.currentTime;
++      this.isPositionInitialized = true;
++    }
++
+     let z: Matrix; // Measurement residual
+     let H: Matrix; // Observation matrix
+     let R: Matrix; // Measurement noise covariance
+-    let threshold = 6.0;
+-
+-    // Derived velocity fallback from GNSS position delta if velocity is null.
+-    // Use this.currentTime (accumulated from predict() dt values) rather than Date.now(),
+-    // because in test environments Date.now() is nearly constant across a synchronous
+-    // loop, making dtGnss ≈ 0 (clamped to 0.1s) and producing 10×-inflated velocity
+-    // estimates that are then rejected by the speed < 40 guard.
++
+     let effectiveVel = gnssVel;
+-    if (effectiveVel === null && this.lastGnssPos !== null && (state === 'GOOD' || state === 'DEGRADED')) {
++    const dxInnov = gnssPos[0] - this.ins.position.x;
++    const dyInnov = gnssPos[1] - this.ins.position.y;
++    const posInnovDist = Math.sqrt(dxInnov * dxInnov + dyInnov * dyInnov);
++
++    const allowMotionRelease = isImuMotionCorroborated || isUncorroboratedEscape;
++
++    if (this.wasZuptActive) {
++      if (gnssVel !== null && gnssReportedSpeed >= 0.4 && allowMotionRelease) {
++        // Genuine vehicle motion corroborated by IMU or sustained escape rule — release ZUPT
++        this.notifyZuptReleased();
++      } else {
++        // When stationary (ZUPT active) or uncorroborated, velocity is 0 — never let GPS jitter/multipath inject false motion
++        effectiveVel = null; // Position-only update
++
++        // IMU-corroboration gate: reject position jumps or uncorroborated high speed while device is still
++        if (!allowMotionRelease && (posInnovDist > 6.0 || gnssReportedSpeed >= 0.4)) {
++          this.lastGnssRejected = true;
++          return false; // Discard uncorroborated multipath jump
++        }
++      }
++    } else if (effectiveVel === null && this.lastGnssPos !== null && (state === 'GOOD' || state === 'DEGRADED')) {
+       const dtGnss = this.lastGnssUpdateTime > 0
+         ? Math.min(Math.max(this.currentTime - this.lastGnssUpdateTime, 0.1), 3.0)
+-        : 0; // No valid prior time — cannot derive velocity
++        : 0;
+       if (dtGnss >= 0.1 && dtGnss <= 3.0) {
+-        const vx = (gnssPos[0] - this.lastGnssPos[0]) / dtGnss;
+-        const vy = (gnssPos[1] - this.lastGnssPos[1]) / dtGnss;
+-        const vz = (gnssPos[2] - this.lastGnssPos[2]) / dtGnss;
++        const dx = gnssPos[0] - this.lastGnssPos[0];
++        const dy = gnssPos[1] - this.lastGnssPos[1];
++        const dz = gnssPos[2] - this.lastGnssPos[2];
++        const disp = Math.sqrt(dx * dx + dy * dy + dz * dz);
++        const vx = dx / dtGnss;
++        const vy = dy / dtGnss;
++        const vz = dz / dtGnss;
+         const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+-        if (speed < 40) {
++
++        // Noise gate: only derive velocity if displacement exceeds GPS jitter threshold
++        const minDispThreshold = state === 'DEGRADED' ? Math.max(3.0, (accuracy || 20) * 0.25) : 0.8;
++        if (disp >= minDispThreshold && speed >= 0.8 && speed < 40) {
+           effectiveVel = [vx, vy, vz];
++        } else {
++          effectiveVel = null; // Position-only update
+         }
+       }
+     }
+@@ -290,61 +345,74 @@
+ 
+     if (state === 'GOOD' || state === 'DEGRADED') {
+       // Dynamic base variance scaled to reported GNSS accuracy (or standard ~1m if unknown)
+-      const basePosVar = accuracy !== null && accuracy > 0 ? Math.max(0.1, (accuracy * accuracy) / 9.0) : 1.0;
+-
+-      if (effectiveVel !== null) {
+-        // GNSS Update (Position & Velocity)
+-        // Observation: 6D (pos x,y,z, vel x,y,z)
+-        H = Matrix.zeros(6, 15);
+-        for (let i = 0; i < 6; i++) {
+-          H.set(i, i, 1);
++      let basePosVar = accuracy !== null && accuracy > 0 ? Math.max(0.1, (accuracy * accuracy) / 9.0) : 1.0;
++
++      // Inflate R if ZUPT is active (suspect stationary period) or under sustained uncorroborated escape mode
++      if (isUncorroboratedEscape) {
++        basePosVar *= 10.0;
++      } else if (this.wasZuptActive && !isImuMotionCorroborated) {
++        basePosVar *= 10.0;
++      }
++
++      // 1. 3D Position Update
++      const H_pos = Matrix.zeros(3, 15);
++      for (let i = 0; i < 3; i++) {
++        H_pos.set(i, i, 1);
++      }
++
++      let R_pos = Matrix.eye(3).mul(basePosVar);
++      if (state === 'DEGRADED') {
++        R_pos = R_pos.mulColumnVector(Matrix.columnVector(Array(3).fill(rScale)));
++      }
++
++      const z_pos = new Matrix([
++        [gnssPos[0] - this.ins.position.x],
++        [gnssPos[1] - this.ins.position.y],
++        [gnssPos[2] - this.ins.position.z],
++      ]);
++      const isUncorroboratedStationary = this.wasZuptActive && !isImuMotionCorroborated && !isUncorroboratedEscape;
++      const posJump = Math.sqrt(z_pos.get(0, 0) * z_pos.get(0, 0) + z_pos.get(1, 0) * z_pos.get(1, 0));
++
++      let posUpdated = false;
++      if (isUncorroboratedStationary && posJump > 2.0) {
++        // While uncorroborated: reject position jumps (> 2.0m)
++        posUpdated = false;
++      } else {
++        const posThreshold = this.postZuptCooldown > 0 ? 150.0 : (this.wasZuptActive ? 6.0 : 45.0);
++        posUpdated = this.applyMeasurementUpdate(H_pos, z_pos, R_pos, posThreshold);
++      }
++
++      // 2. 3D Velocity Update (when available)
++      let velUpdated = false;
++      if (effectiveVel !== null && !isUncorroboratedStationary) {
++        const H_vel = Matrix.zeros(3, 15);
++        for (let i = 0; i < 3; i++) {
++          H_vel.set(i, 3 + i, 1);
+         }
+ 
+-        R = Matrix.eye(6).mul(basePosVar);
+-        for (let i = 3; i < 6; i++) {
+-          R.set(i, i, gnssVel !== null ? 0.1 : 5.0); 
++        const baseVelVar = isUncorroboratedEscape ? 2.5 : (gnssVel !== null ? 0.01 : 1.0);
++        let R_vel = Matrix.eye(3).mul(baseVelVar);
++        if (state === 'DEGRADED') {
++          R_vel = R_vel.mulColumnVector(Matrix.columnVector(Array(3).fill(rScale)));
+         }
+-        if (state === 'DEGRADED') {
+-          R = R.mulColumnVector(Matrix.columnVector(Array(6).fill(rScale)));
+-        }
+-
+-        // Residual z = GNSS - INS
+-        z = new Matrix([
+-          [gnssPos[0] - this.ins.position.x],
+-          [gnssPos[1] - this.ins.position.y],
+-          [gnssPos[2] - this.ins.position.z],
++
++        const z_vel = new Matrix([
+           [effectiveVel[0] - this.ins.velocity.x],
+           [effectiveVel[1] - this.ins.velocity.y],
+           [effectiveVel[2] - this.ins.velocity.z],
+         ]);
+-        threshold = 25.0;
+-      } else {
+-        // GNSS Update (Position Only)
+-        // Observation: 3D (pos x,y,z)
+-        H = Matrix.zeros(3, 15);
+-        for (let i = 0; i < 3; i++) {
+-          H.set(i, i, 1);
+-        }
+-
+-        R = Matrix.eye(3).mul(basePosVar);
+-        if (state === 'DEGRADED') {
+-          R = R.mulColumnVector(Matrix.columnVector(Array(3).fill(rScale)));
+-        }
+-
+-        // Residual z = GNSS - INS
+-        z = new Matrix([
+-          [gnssPos[0] - this.ins.position.x],
+-          [gnssPos[1] - this.ins.position.y],
+-          [gnssPos[2] - this.ins.position.z],
+-        ]);
+-        threshold = 7.8;
+-      }
+-
+-      this.applyMeasurementUpdate(H, z, R, threshold);
++        const velThreshold = this.postZuptCooldown > 0 ? 150.0 : (isUncorroboratedEscape ? 60.0 : 45.0);
++        velUpdated = this.applyMeasurementUpdate(H_vel, z_vel, R_vel, velThreshold);
++      }
++
++      this.lastGnssRejected = effectiveVel !== null ? (!posUpdated && !velUpdated) : !posUpdated;
++
++      if (this.isAttitudeInitialized && !this.wasZuptActive) {
++        this.applyNhc(0.05, 0.01);
++      }
+ 
+     } else {
+       // WEAK_LOST State: Use AI pseudo-measurement and NHC
+-      // 1. Ask AI for velocity error correction
+       const aiCorrection = this.aiModel.predictError(
+         state, 
+         recentImuWindow, 
+@@ -352,40 +420,31 @@
+       );
+       this.lastAiCorrection = aiCorrection ? [...aiCorrection] : null;
+ 
+-      // We'll update 2D velocity (vx = East, vy = North) from AI
+       H = Matrix.zeros(2, 15);
+       H.set(0, 3, 1); // z[0] is East velocity error -> maps to state 3 (vx)
+       H.set(1, 4, 1); // z[1] is North velocity error -> maps to state 4 (vy)
+ 
+-      // AI confidence is lower than GNSS, so base R is higher
+       R = Matrix.eye(2).mul(0.5);
+ 
+       if (aiCorrection) {
+-        // AI predicts the *error* in INS velocity.
+-        // So residual z = aiCorrection
+         z = new Matrix([
+           [aiCorrection[0]],
+           [aiCorrection[1]]
+         ]);
+       } else {
+-        // Fallback if AI fails: zero-update (no correction)
+         z = Matrix.zeros(2, 1);
+         R = Matrix.eye(2).mul(1000); // Discard
+       }
+ 
+       this.applyMeasurementUpdate(H, z, R, 6.0);
+ 
+-      // 2. Apply Non-Holonomic Constraints (NHC) in WEAK_LOST mode
+-      // Guard: only apply NHC after attitude is initialized. Before initialization,
+-      // C_b_n is identity and lastSpecificForce contains ~9.81 m/s² gravity, which
+-      // projects directly into navigation-frame v_lat and v_vert, driving them above
+-      // ±60 m/s on the very first cycle and permanently saturating the velocity clamp.
+       if (this.isAttitudeInitialized) {
+         this.applyNhc(0.05, 0.01);
+       }
+     }
+ 
+     this.applyVelocityGuard();
++    return !this.lastGnssRejected;
+   }
+ 
+   /**
+@@ -401,7 +460,6 @@
+     // High confidence that velocity is 0
+     const R = Matrix.eye(3).mul(0.001);
+ 
+-    // Residual z = 0 - INS Velocity
+     const z = new Matrix([
+       [-this.ins.velocity.x],
+       [-this.ins.velocity.y],
+@@ -410,18 +468,27 @@
+ 
+     this.applyMeasurementUpdate(H, z, R, Infinity);
+ 
+-    // Track ZUPT state for Q scheduling: when ZUPT stops, start cooldown
+     this.wasZuptActive = true;
+ 
+-    // Hard override velocity to exactly 0 to eliminate any micro-jitter (0.02 - 0.1 m/s)
++    // Hard override velocity to exactly 0 to eliminate any micro-jitter
+     this.ins.velocity.x = 0;
+     this.ins.velocity.y = 0;
+     this.ins.velocity.z = 0;
+ 
+-    // Reset velocity error in the EKF state vector to prevent accumulation
++    // Reset velocity error in the EKF state vector
+     this.x.set(3, 0, 0);
+     this.x.set(4, 0, 0);
+     this.x.set(5, 0, 0);
++
++    // Bound estimated biases to realistic physical ranges
++    for (let i = 9; i < 12; i++) {
++      const b = this.x.get(i, 0);
++      if (Math.abs(b) > 1.5) this.x.set(i, 0, Math.sign(b) * 1.5);
++    }
++    for (let i = 12; i < 15; i++) {
++      const b = this.x.get(i, 0);
++      if (Math.abs(b) > 0.1) this.x.set(i, 0, Math.sign(b) * 0.1);
++    }
+ 
+     this.applyVelocityGuard();
+   }
+@@ -445,9 +512,6 @@
+       return;
+     }
+ 
+-    // Per-step velocity-jump rate limiter / monitor:
+-    // Log a warning if |velocity| changes by > 3 m/s in a single fusion cycle (e.g. 100ms)
+-    // and dump the full state (raw accel, filtered accel, Q at that step, ZUPT state, AI correction).
+     const MAX_VELOCITY_JUMP = 3.0; // m/s per cycle
+     const dx = v.x - this.previousVelocity.x;
+     const dy = v.y - this.previousVelocity.y;
+@@ -478,31 +542,28 @@
+     this.previousVelocity = { x: v.x, y: v.y, z: v.z };
+   }
+ 
+-  /**
+-   * Called by FusionRuntime once the initial stationary alignment is complete and
+-   * the rotation matrix C_b_n is valid. Enables NHC and other attitude-dependent guards.
+-   */
+   public notifyAttitudeInitialized() {
+     this.isAttitudeInitialized = true;
+   }
+ 
+-  /**
+-   * Called by FusionRuntime when ZUPT was active last cycle but is no longer.
+-   * Triggers post-ZUPT cooldown for Q scheduling.
+-   */
+   public notifyZuptReleased() {
+     if (this.wasZuptActive) {
+       this.postZuptCooldown = this.POST_ZUPT_COOLDOWN_CYCLES;
+       this.wasZuptActive = false;
++      for (let i = 0; i < 3; i++) {
++        this.P.set(i, i, Math.max(this.P.get(i, i), 5.0));
++      }
++      for (let i = 3; i < 6; i++) {
++        this.P.set(i, i, Math.max(this.P.get(i, i), 5.0));
++      }
+     }
+   }
+ }
+ 
+-// Helper for Matrix Inverse (ml-matrix inverse() can fail on singular)
+ function inverse(m: Matrix): Matrix | null {
+   try {
+     return mlInverse(m);
+-  } catch (e) {
++  } catch {
+     return null;
+   }
+ }

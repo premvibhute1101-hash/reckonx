@@ -109,40 +109,83 @@ export const SensorService = {
    * Subscribe to real hardware devicemotion stream (3-axis Accel + 3-axis Gyro)
    * Strictly reads real hardware measurements and computes physical magnitudes.
    */
-  subscribeMotion(onData: (data: RawMotionSample) => void): () => void {
+  subscribeMotion(onData: (data: RawMotionSample) => void, options?: { targetHz?: number }): () => void {
     if (!SensorService.hasMotionSupport()) return () => {};
 
+    // High-pass filter state for fallback when event.acceleration is null/unsupported
+    let hpfGravity = { x: 0, y: 0, z: 9.81 };
+    let hasHpfInit = false;
+    let lastSampleTime = 0;
+    const minIntervalMs = options?.targetHz && options.targetHz > 0 ? (1000 / options.targetHz) - 2 : 0;
+
     const handler = (event: DeviceMotionEvent) => {
-      // 1. Accelerometer: Prefer accelerationIncludingGravity for raw IMU specific force (standard INS input),
-      // fallback to linear acceleration + gravity baseline.
-      const raw = event.accelerationIncludingGravity;
+      // Hardware timestamp synchronization (sub-millisecond DOM clock relative to performance.timeOrigin)
+      let timestamp = Date.now();
+      if (typeof event.timeStamp === 'number' && event.timeStamp > 0) {
+        if (typeof performance !== 'undefined' && typeof performance.timeOrigin === 'number') {
+          timestamp = Math.round(performance.timeOrigin + event.timeStamp);
+        } else {
+          timestamp = Math.round(event.timeStamp);
+        }
+      }
+
+      // Optional rate throttling if targetHz is requested
+      if (minIntervalMs > 0 && lastSampleTime > 0 && (timestamp - lastSampleTime) < minIntervalMs) {
+        return;
+      }
+      lastSampleTime = timestamp;
+
+      // 1. Accelerometer: Strictly prefer event.acceleration (linear acceleration with gravity removed by OS)
       const lin = event.acceleration;
+      const raw = event.accelerationIncludingGravity;
 
       let ax = 0;
       let ay = 0;
-      let az = 9.81;
+      let az = 0;
 
-      if (raw && raw.z != null && !isNaN(raw.z)) {
-        ax = raw.x != null ? raw.x : 0;
-        ay = raw.y != null ? raw.y : 0;
-        az = raw.z != null ? raw.z : 9.81;
-      } else if (lin && lin.z != null && !isNaN(lin.z)) {
-        ax = lin.x != null ? lin.x : 0;
-        ay = lin.y != null ? lin.y : 0;
-        az = (lin.z != null ? lin.z : 0) + 9.81;
+      const hasLin = lin != null &&
+        lin.x != null && !isNaN(lin.x) &&
+        lin.y != null && !isNaN(lin.y) &&
+        lin.z != null && !isNaN(lin.z);
+
+      if (hasLin) {
+        ax = lin.x!;
+        ay = lin.y!;
+        az = lin.z!;
+      } else if (raw && raw.z != null && !isNaN(raw.z)) {
+        // Fallback: event.acceleration is null (e.g. some Android WebViews).
+        // Apply high-pass filter to aggressively strip the ~9.81 m/s² DC gravity component.
+        const rx = raw.x != null && !isNaN(raw.x) ? raw.x : 0;
+        const ry = raw.y != null && !isNaN(raw.y) ? raw.y : 0;
+        const rz = raw.z != null && !isNaN(raw.z) ? raw.z : 9.81;
+
+        if (!hasHpfInit) {
+          hpfGravity = { x: rx, y: ry, z: rz };
+          hasHpfInit = true;
+        } else {
+          // Low-pass filter to track DC gravity baseline (alpha = 0.05)
+          const alphaG = 0.05;
+          hpfGravity.x = (1 - alphaG) * hpfGravity.x + alphaG * rx;
+          hpfGravity.y = (1 - alphaG) * hpfGravity.y + alphaG * ry;
+          hpfGravity.z = (1 - alphaG) * hpfGravity.z + alphaG * rz;
+        }
+
+        // Subtract tracked DC gravity vector to isolate pure linear acceleration
+        ax = rx - hpfGravity.x;
+        ay = ry - hpfGravity.y;
+        az = rz - hpfGravity.z;
       }
 
       const accelMag = Math.sqrt(ax * ax + ay * ay + az * az);
 
       // 2. Gyroscope: rotationRate around x (beta), y (gamma), z (alpha)
       const rot = event.rotationRate;
-      const gx = rot?.beta != null ? rot.beta : 0;   // deg/s around X
-      const gy = rot?.gamma != null ? rot.gamma : 0;  // deg/s around Y
-      const gz = rot?.alpha != null ? rot.alpha : 0;  // deg/s around Z
+      const gx = rot?.beta != null && !isNaN(rot.beta) ? rot.beta : 0;   // deg/s around X
+      const gy = rot?.gamma != null && !isNaN(rot.gamma) ? rot.gamma : 0;  // deg/s around Y
+      const gz = rot?.alpha != null && !isNaN(rot.alpha) ? rot.alpha : 0;  // deg/s around Z
       const gyroMag = Math.sqrt(gx * gx + gy * gy + gz * gz);
 
       const intervalMs = event.interval || 16;
-      const timestamp = Date.now();
 
       onData({
         ax: Math.round(ax * 1000) / 1000,

@@ -24,6 +24,9 @@ export class InsMechanization {
   private filteredZHist: number[] = [0, 0];
   private filteredAccel: { x: number; y: number; z: number } | null = null;
 
+  // Running estimate of body-frame gravity vector (Anti-Gravity tracking)
+  public estimatedGravity: { x: number; y: number; z: number } = { x: 0, y: 0, z: 9.81 };
+
   public setState(
     position: { x: number; y: number; z: number },
     velocity: { x: number; y: number; z: number },
@@ -35,11 +38,19 @@ export class InsMechanization {
   }
 
   public initializeAttitude(accel: { x: number; y: number; z: number }) {
-    // Standard gravity vector alignment:
-    // Roll (rotation around body X-axis) = atan2(ay, az)
-    // Pitch (rotation around body Y-axis) = atan2(-ax, sqrt(ay^2 + az^2))
-    this.attitude.roll = Math.atan2(accel.y, accel.z);
-    this.attitude.pitch = Math.atan2(-accel.x, Math.sqrt(accel.y * accel.y + accel.z * accel.z));
+    const mag = Math.sqrt(accel.x * accel.x + accel.y * accel.y + accel.z * accel.z);
+    this.estimatedGravity = { x: accel.x, y: accel.y, z: accel.z };
+    if (mag > 3.0) {
+      // Specific force reading with gravity baseline:
+      // Roll (rotation around body X-axis) = atan2(ay, az)
+      // Pitch (rotation around body Y-axis) = atan2(-ax, sqrt(ay^2 + az^2))
+      this.attitude.roll = Math.atan2(accel.y, accel.z);
+      this.attitude.pitch = Math.atan2(-accel.x, Math.sqrt(accel.y * accel.y + accel.z * accel.z));
+    } else {
+      // Pure linear acceleration reading (gravity already removed)
+      this.attitude.roll = 0;
+      this.attitude.pitch = 0;
+    }
     // Also seed the LPF history with the initial reading to prevent startup transients
     this.accelXHist = [accel.x, accel.x];
     this.accelYHist = [accel.y, accel.y];
@@ -120,54 +131,75 @@ export class InsMechanization {
     let newPitch = this.attitude.pitch + gyro.y * dt;
     this.attitude.yaw += gyro.z * dt;
 
-    // 2. Dynamic Gravity Leveling / Continuous Tilt Correction
-    // When stationary or in quasi-steady motion without horizontal acceleration,
-    // drive estimated roll/pitch toward the accelerometer gravity vector.
-    // Suppressed when horizontal acceleration is present (e.g. vehicle accel/braking or walking strides > 0.15 m/s^2)
-    const accelMag = Math.sqrt(fAccel.x * fAccel.x + fAccel.y * fAccel.y + fAccel.z * fAccel.z);
-    const gravityDiff = Math.abs(accelMag - this.gravity);
-
-    const rollAcc = Math.atan2(fAccel.y, fAccel.z);
-    const pitchAcc = Math.atan2(-fAccel.x, Math.sqrt(fAccel.y * fAccel.y + fAccel.z * fAccel.z));
-
-    // Pitch leveling: Lateral acceleration (fAccel.x) has zero mean during forward travel,
-    // so pitch is continuously leveled against gyro integration drift
-    const alphaPitch = Math.min(0.2, 0.4 * dt);
-    newPitch = newPitch + alphaPitch * (pitchAcc - newPitch);
-
-    // Roll leveling: Forward body acceleration (fAccel.y) can be sustained during vehicle maneuvers,
-    // so roll is gated on |fAccel.y| to prevent vehicle acceleration from being interpreted as tilt
-    let alphaRoll = 0.02 * dt;
-    if (Math.abs(fAccel.y) < 0.08 && gravityDiff < 0.3) {
-      const gainWeight = Math.max(0, 1 - (Math.abs(fAccel.y) / 0.08)) * Math.max(0, 1 - (gravityDiff / 0.3));
-      alphaRoll += 0.78 * gainWeight * dt;
-    }
-    alphaRoll = Math.min(0.2, alphaRoll);
-    newRoll = newRoll + alphaRoll * (rollAcc - newRoll);
-
-    this.attitude.roll = newRoll;
-    this.attitude.pitch = newPitch;
-
-    // 3. Transform body frame acceleration to navigation frame (ENU)
-    const cRoll = Math.cos(this.attitude.roll);
-    const sRoll = Math.sin(this.attitude.roll);
-    const cPitch = Math.cos(this.attitude.pitch);
-    const sPitch = Math.sin(this.attitude.pitch);
+    // 2. Transform body frame acceleration to navigation frame (ENU) using gyro-integrated attitude
+    let cRoll = Math.cos(newRoll);
+    let sRoll = Math.sin(newRoll);
+    let cPitch = Math.cos(newPitch);
+    let sPitch = Math.sin(newPitch);
     const cYaw = Math.cos(this.attitude.yaw);
     const sYaw = Math.sin(this.attitude.yaw);
 
     // Standard Z-Y-X (Yaw-Pitch-Roll) Rotation Matrix R_b^n (Body to Nav ENU)
-    const R11 = cYaw * cPitch;
-    const R12 = cYaw * sPitch * sRoll - sYaw * cRoll;
-    const R13 = cYaw * sPitch * cRoll + sYaw * sRoll;
+    let R11 = cYaw * cPitch;
+    let R12 = cYaw * sPitch * sRoll - sYaw * cRoll;
+    let R13 = cYaw * sPitch * cRoll + sYaw * sRoll;
 
-    const R21 = sYaw * cPitch;
-    const R22 = sYaw * sPitch * sRoll + cYaw * cRoll;
-    const R23 = sYaw * sPitch * cRoll - cYaw * sRoll;
+    let R21 = sYaw * cPitch;
+    let R22 = sYaw * sPitch * sRoll + cYaw * cRoll;
+    let R23 = sYaw * sPitch * cRoll - cYaw * sRoll;
 
-    const R31 = -sPitch;
-    const R32 = cPitch * sRoll;
-    const R33 = cPitch * cRoll;
+    let R31 = -sPitch;
+    let R32 = cPitch * sRoll;
+    let R33 = cPitch * cRoll;
+
+    const init_a_n_x = R11 * fAccel.x + R12 * fAccel.y + R13 * fAccel.z;
+    const init_a_n_y = R21 * fAccel.x + R22 * fAccel.y + R23 * fAccel.z;
+    const horizSpecificForce = Math.sqrt(init_a_n_x * init_a_n_x + init_a_n_y * init_a_n_y);
+
+    // 3. Dynamic Gravity Extraction (Anti-Gravity) & Tilt Correction
+    // ONLY update the gravity estimate when strictly stationary:
+    // horizontal specific force < 0.05 m/s^2, rotation rate < 0.05 rad/s, and total accel either near 9.81 m/s^2 (+/- 0.3 m/s^2) or near 0 m/s^2 (< 0.05 m/s^2).
+    const accelMag = Math.sqrt(fAccel.x * fAccel.x + fAccel.y * fAccel.y + fAccel.z * fAccel.z);
+    const gyroMag = Math.sqrt(gyro.x * gyro.x + gyro.y * gyro.y + gyro.z * gyro.z);
+    const isStrictlyStationary = horizSpecificForce < 0.05 && gyroMag < 0.05 && (Math.abs(accelMag - this.gravity) < 0.3 || accelMag < 0.05);
+
+    if (isStrictlyStationary) {
+      // Low-pass filter update for estimated body-frame gravity vector (alpha = 0.05)
+      const alphaG = 0.05;
+      this.estimatedGravity.x = (1 - alphaG) * this.estimatedGravity.x + alphaG * fAccel.x;
+      this.estimatedGravity.y = (1 - alphaG) * this.estimatedGravity.y + alphaG * fAccel.y;
+      this.estimatedGravity.z = (1 - alphaG) * this.estimatedGravity.z + alphaG * fAccel.z;
+
+      // Continuous tilt leveling towards tracked gravity vector if gravity is present
+      if (accelMag > 3.0) {
+        const rollAcc = Math.atan2(this.estimatedGravity.y, this.estimatedGravity.z);
+        const pitchAcc = Math.atan2(-this.estimatedGravity.x, Math.sqrt(this.estimatedGravity.y * this.estimatedGravity.y + this.estimatedGravity.z * this.estimatedGravity.z));
+
+        const alphaAtt = Math.min(0.2, 0.4 * dt);
+        newPitch = newPitch + alphaAtt * (pitchAcc - newPitch);
+        newRoll = newRoll + alphaAtt * (rollAcc - newRoll);
+
+        cRoll = Math.cos(newRoll);
+        sRoll = Math.sin(newRoll);
+        cPitch = Math.cos(newPitch);
+        sPitch = Math.sin(newPitch);
+
+        R11 = cYaw * cPitch;
+        R12 = cYaw * sPitch * sRoll - sYaw * cRoll;
+        R13 = cYaw * sPitch * cRoll + sYaw * sRoll;
+
+        R21 = sYaw * cPitch;
+        R22 = sYaw * sPitch * sRoll + cYaw * cRoll;
+        R23 = sYaw * sPitch * cRoll - cYaw * sRoll;
+
+        R31 = -sPitch;
+        R32 = cPitch * sRoll;
+        R33 = cPitch * cRoll;
+      }
+    }
+
+    this.attitude.roll = newRoll;
+    this.attitude.pitch = newPitch;
 
     this.lastRotationMatrix = [
       [R11, R12, R13],
@@ -175,21 +207,41 @@ export class InsMechanization {
       [R31, R32, R33]
     ];
 
-    let a_n_x = R11 * fAccel.x + R12 * fAccel.y + R13 * fAccel.z;
-    let a_n_y = R21 * fAccel.x + R22 * fAccel.y + R23 * fAccel.z;
-    let a_n_z = R31 * fAccel.x + R32 * fAccel.y + R33 * fAccel.z;
+    // Subtract dynamically tracked gravity in body frame to isolate pure linear acceleration
+    const a_lin_bx = fAccel.x - this.estimatedGravity.x;
+    const a_lin_by = fAccel.y - this.estimatedGravity.y;
+    const a_lin_bz = fAccel.z - this.estimatedGravity.z;
 
-    this.lastSpecificForce = { x: a_n_x, y: a_n_y, z: a_n_z };
+    const raw_a_n_x = R11 * a_lin_bx + R12 * a_lin_by + R13 * a_lin_bz;
+    const raw_a_n_y = R21 * a_lin_bx + R22 * a_lin_by + R23 * a_lin_bz;
+    const raw_a_n_z = R31 * a_lin_bx + R32 * a_lin_by + R33 * a_lin_bz;
 
-    // 4. Subtract gravity (assuming Z is up in ENU)
-    const a_n_z_no_g = a_n_z - this.gravity;
+    // Specific force for EKF F-matrix tracking (includes gravity and true un-clamped dynamics)
+    this.lastSpecificForce = {
+      x: raw_a_n_x,
+      y: raw_a_n_y,
+      z: raw_a_n_z + (accelMag > 3.0 ? this.gravity : 0)
+    };
 
-    // 5. Integrate acceleration into velocity
+    let a_n_x = raw_a_n_x;
+    let a_n_y = raw_a_n_y;
+    let a_n_z = raw_a_n_z;
+
+    // 4. Deadband Thresholding:
+    // If linear acceleration magnitude on the horizontal plane is sub-threshold (< 0.08 m/s²),
+    // clamp to exactly 0.0 to prevent noise integration during still or sub-threshold periods.
+    const horizLinearMag = Math.sqrt(a_n_x * a_n_x + a_n_y * a_n_y);
+    if (horizLinearMag < 0.08) {
+      a_n_x = 0;
+      a_n_y = 0;
+    }
+
+    // 5. Integrate linear acceleration into velocity
     this.velocity.x += a_n_x * dt;
     this.velocity.y += a_n_y * dt;
-    this.velocity.z += a_n_z_no_g * dt;
+    this.velocity.z += a_n_z * dt;
 
-    // 7. Integrate velocity into position
+    // 6. Integrate velocity into position
     this.position.x += this.velocity.x * dt;
     this.position.y += this.velocity.y * dt;
     this.position.z += this.velocity.z * dt;

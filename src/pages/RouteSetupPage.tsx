@@ -226,7 +226,7 @@ export const RouteSetupPage: React.FC = () => {
 
   return (
     <MobileShell header={header} footer={<BottomNav />}>
-      <div className="flex flex-col space-y-4 p-4 pb-24">
+      <div className="flex flex-col space-y-4 p-4">
         {/* Top Mode & GPS Precision Bar */}
         <div className="flex items-center justify-between text-[10px] font-mono bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs">
           <span className="flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">

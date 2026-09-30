@@ -35,9 +35,8 @@ export const ProfilePage: React.FC = () => {
 
   return (
     <MobileShell header={header} footer={<BottomNav />}>
-      <div className="h-full flex flex-col justify-between p-4 pb-20">
-        <div className="space-y-4">
-          {/* Clean Local Profile Card */}
+      <div className="p-4 space-y-4">
+        {/* Clean Local Profile Card */}
           <div className="bg-white border border-slate-200 rounded-md p-4 space-y-3 shadow-xs">
             <div className="flex items-center gap-3">
               <div className="w-11 h-11 bg-blue-700 text-white rounded-full flex items-center justify-center font-bold text-xs shadow-xs">
@@ -236,7 +235,6 @@ export const ProfilePage: React.FC = () => {
             <span>Sign Out Session</span>
           </button>
         </div>
-      </div>
     </MobileShell>
   );
 };

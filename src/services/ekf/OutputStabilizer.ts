@@ -1,8 +1,9 @@
 import { Matrix, inverse as mlInverse } from 'ml-matrix';
+import { EARTH_RADIUS_METERS } from '../../constants/geodesy';
 
 // Haversine formula to calculate distance in meters between two lat/lon points
 export function haversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371e3; // Earth radius in meters
+  const R = EARTH_RADIUS_METERS; // Earth radius in meters
   const rLat1 = (lat1 * Math.PI) / 180;
   const rLat2 = (lat2 * Math.PI) / 180;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -35,7 +36,7 @@ export function projectLocation(
   distanceMeters: number,
   bearing: number
 ): { lat: number; lon: number } {
-  const R = 6371e3;
+  const R = EARTH_RADIUS_METERS;
   const rLat = (lat * Math.PI) / 180;
   const rLon = (lon * Math.PI) / 180;
 
@@ -303,6 +304,12 @@ export class OutputStabilizer {
   }
 
   public process(input: StabilizerInput): StabilizedOutput {
+    // If reacquiring clear sky GNSS after an outage/tunnel (WEAK_LOST), reset rate limiter & smoother
+    // to cleanly acquire the true fix without dragging or clamping against the dead-reckoning trajectory
+    if (this.previousAccepted && this.previousAccepted.gnssState === 'WEAK_LOST' && input.gnssState === 'GOOD') {
+      this.reset();
+    }
+
     // 1. Rate Limiting (Clamping)
     const { output: limitedInput, clampEvent } = this.rateLimiter.filter(
       input,

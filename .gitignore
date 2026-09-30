@@ -40,3 +40,9 @@ env/
 *.sln
 *.sw?
 
+# Scratch and Large Media Artifacts
+scratch/
+*/scratch/
+*.mp4
+
+

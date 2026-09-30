@@ -653,27 +653,42 @@ export function matchSegmentWithGraph(
     const impliedSpeedKmh = (distM / dtSec) * 3.6;
     const loggedSpeedKmh = Math.max(rawCurr.speedKmH || 0, rawPrev.speedKmH || 0);
     const maxAllowedSpeedKmh = Math.max(2.0 * loggedSpeedKmh, 65.0);
+    // Generous limit for repair paths: allows catching up from a frozen junction over 1-2 steps
+    const repairMaxAllowedSpeedKmh = Math.max(3.5 * loggedSpeedKmh, 90.0);
 
     // Freeze detection during vehicle motion (logged speed > 5 km/h)
     if (distM < 0.5 && loggedSpeedKmh > 5.0) {
       consecutiveFrozenSamples++;
       if (consecutiveFrozenSamples >= 3) {
-        return {
-          matched: false,
-          reason: `frozen_output_detected_at_step_${t}_(${consecutiveFrozenSamples}_consecutive_samples)`,
+        // Graph gap vector bridge: vehicle has moved across an unmapped section
+        const dLat = rawCurr.lat - rawPrev.lat;
+        const dLng = rawCurr.lng - rawPrev.lng;
+        expandedPoints[t] = {
+          lat: expandedPoints[t - 1].lat + dLat,
+          lng: expandedPoints[t - 1].lng + dLng,
         };
+        expandedStates[t] = {
+          edge: pPrev.edge,
+          projectedLat: expandedPoints[t].lat,
+          projectedLng: expandedPoints[t].lng,
+          distToGpsM: haversineDistance(rawCurr.lat, rawCurr.lng, expandedPoints[t].lat, expandedPoints[t].lng),
+          offsetM: pPrev.offsetM,
+        };
+        consecutiveFrozenSamples = 0;
+        continue;
       }
     } else {
       consecutiveFrozenSamples = 0;
     }
 
     if (impliedSpeedKmh > maxAllowedSpeedKmh) {
-      // Unphysical jump detected! Attempt local edge projection repair
+      // Unphysical jump detected! Attempt local edge projection repair.
       const geomPrev = pPrev.edge.geometry;
       let repairedDist = Infinity;
       let repLat = expandedPoints[t].lat;
       let repLng = expandedPoints[t].lng;
       let repOffset = 0;
+      let repEdge = pPrev.edge;
       let acc = 0;
 
       for (let segIdx = 0; segIdx < geomPrev.length - 1; segIdx++) {
@@ -692,41 +707,160 @@ export function matchSegmentWithGraph(
         acc += segLen;
       }
 
-      const repairedJumpM = haversineDistance(
+      let repairedJumpM = haversineDistance(
         expandedPoints[t - 1].lat,
         expandedPoints[t - 1].lng,
         repLat,
         repLng
       );
-      const repairedSpeedKmh = (repairedJumpM / dtSec) * 3.6;
 
-      // Ensure repair does not cause a continuous freeze clamp during motion
+      // Edge-end extension: if the same-edge repair yields a frozen result
+      // (< 0.5 m advance) while the vehicle is moving AND the raw position has
+      // advanced significantly (> 3 m) from the last projected point, the vehicle
+      // has legitimately passed the end-node of pPrev.edge.  Search adjacent
+      // outgoing edges and pick the one whose projection best explains rawCurr.
+      if (repairedJumpM < 0.5 && loggedSpeedKmh > 5.0) {
+        const rawAdvance = haversineDistance(
+          expandedPoints[t - 1].lat,
+          expandedPoints[t - 1].lng,
+          rawCurr.lat,
+          rawCurr.lng
+        );
+        if (rawAdvance > 3.0) {
+          // Try projecting rawCurr onto each edge leaving the end-node of pPrev.edge
+          const endNodeId = pPrev.edge.toNodeId;
+          const outEdges = graph.adjacency.get(endNodeId) ?? [];
+          for (const adjEntry of outEdges) {
+            const adjEdge = graph.edges.get(adjEntry.edgeId);
+            if (!adjEdge) continue;
+            const adjGeom = adjEdge.geometry;
+            let adjAcc = 0;
+            for (let si = 0; si < adjGeom.length - 1; si++) {
+              const s1 = adjGeom[si];
+              const s2 = adjGeom[si + 1];
+              const sLen = haversineDistance(s1[0], s1[1], s2[0], s2[1]);
+              const proj = projectPointOnSegment([rawCurr.lat, rawCurr.lng], s1, s2);
+              const d = haversineDistance(rawCurr.lat, rawCurr.lng, proj[0], proj[1]);
+              const jumpCandidate = haversineDistance(
+                expandedPoints[t - 1].lat,
+                expandedPoints[t - 1].lng,
+                proj[0],
+                proj[1]
+              );
+              if (d < repairedDist && jumpCandidate > 0.1 && (jumpCandidate / dtSec) * 3.6 <= repairMaxAllowedSpeedKmh) {
+                repairedDist = d;
+                repLat = proj[0];
+                repLng = proj[1];
+                repOffset = adjAcc + haversineDistance(s1[0], s1[1], proj[0], proj[1]);
+                repEdge = adjEdge;
+              }
+              adjAcc += sLen;
+            }
+          }
+          repairedJumpM = haversineDistance(
+            expandedPoints[t - 1].lat,
+            expandedPoints[t - 1].lng,
+            repLat,
+            repLng
+          );
+        }
+      }
+
+      const repairedSpeedKmh = (repairedJumpM / dtSec) * 3.6;
+      const effectiveRepairMax = repairMaxAllowedSpeedKmh;
+
+      // Count consecutive frozen clamps only if extension could not help
       if (repairedJumpM < 0.5 && loggedSpeedKmh > 5.0) {
         consecutiveClampedRepairs++;
         if (consecutiveClampedRepairs >= 2) {
-          return {
-            matched: false,
-            reason: `unphysical_jump_and_frozen_clamp_at_step_${t}`,
-          };
+          // Graph gap vector bridge: extrapolate along true motion increment
+          const dLat = rawCurr.lat - rawPrev.lat;
+          const dLng = rawCurr.lng - rawPrev.lng;
+          repLat = expandedPoints[t - 1].lat + dLat;
+          repLng = expandedPoints[t - 1].lng + dLng;
+          repairedDist = haversineDistance(rawCurr.lat, rawCurr.lng, repLat, repLng);
+          repairedJumpM = haversineDistance(expandedPoints[t - 1].lat, expandedPoints[t - 1].lng, repLat, repLng);
+          consecutiveClampedRepairs = 0;
         }
       } else {
         consecutiveClampedRepairs = 0;
       }
 
-      if (repairedSpeedKmh <= maxAllowedSpeedKmh) {
+      if (repairedSpeedKmh <= effectiveRepairMax) {
         expandedPoints[t] = { lat: repLat, lng: repLng };
         expandedStates[t] = {
-          edge: pPrev.edge,
+          edge: repEdge,
           projectedLat: repLat,
           projectedLng: repLng,
           distToGpsM: repairedDist,
           offsetM: repOffset,
         };
       } else {
-        return {
-          matched: false,
-          reason: `unphysical_speed_jump_${impliedSpeedKmh.toFixed(1)}_kmh_at_step_${t}`,
-        };
+        // Repair on pPrev.edge still over speed limit — the Viterbi selected
+        // a wrong edge (wrong HMM path or late edge crossing).
+        // Do a fresh nearest-candidate search around rawCurr and pick any
+        // projection that yields a physically plausible jump from the last
+        // matched position.
+        let freshRepLat = repLat;
+        let freshRepLng = repLng;
+        let freshRepDist = Infinity;
+        let freshRepOffset = repOffset;
+        let freshRepEdge = repEdge;
+
+        const freshCands = graph.findCandidates(rawCurr, 80.0, 12);
+        for (const fc of freshCands) {
+          const jumpCand = haversineDistance(
+            expandedPoints[t - 1].lat,
+            expandedPoints[t - 1].lng,
+            fc.projectedLat,
+            fc.projectedLng
+          );
+          const candSpeedKmh = (jumpCand / dtSec) * 3.6;
+          if (
+            fc.distToGpsM < freshRepDist &&
+            jumpCand > 0.1 &&
+            candSpeedKmh <= repairMaxAllowedSpeedKmh
+          ) {
+            freshRepDist = fc.distToGpsM;
+            freshRepLat = fc.projectedLat;
+            freshRepLng = fc.projectedLng;
+            freshRepOffset = fc.offsetM;
+            freshRepEdge = fc.edge;
+          }
+        }
+
+        const freshJumpM = haversineDistance(
+          expandedPoints[t - 1].lat,
+          expandedPoints[t - 1].lng,
+          freshRepLat,
+          freshRepLng
+        );
+        const freshSpeedKmh = (freshJumpM / dtSec) * 3.6;
+
+        if (freshSpeedKmh <= repairMaxAllowedSpeedKmh && freshRepDist < Infinity) {
+          expandedPoints[t] = { lat: freshRepLat, lng: freshRepLng };
+          expandedStates[t] = {
+            edge: freshRepEdge,
+            projectedLat: freshRepLat,
+            projectedLng: freshRepLng,
+            distToGpsM: freshRepDist,
+            offsetM: freshRepOffset,
+          };
+        } else {
+          // Graph gap vector bridge fallback: extrapolate along vehicle motion vector
+          const dLat = rawCurr.lat - rawPrev.lat;
+          const dLng = rawCurr.lng - rawPrev.lng;
+          const bridgeLat = expandedPoints[t - 1].lat + dLat;
+          const bridgeLng = expandedPoints[t - 1].lng + dLng;
+          expandedPoints[t] = { lat: bridgeLat, lng: bridgeLng };
+          expandedStates[t] = {
+            edge: pPrev.edge,
+            projectedLat: bridgeLat,
+            projectedLng: bridgeLng,
+            distToGpsM: haversineDistance(rawCurr.lat, rawCurr.lng, bridgeLat, bridgeLng),
+            offsetM: pPrev.offsetM,
+          };
+        }
       }
     }
   }

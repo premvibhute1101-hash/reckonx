@@ -23,6 +23,7 @@ import { TileCacheService } from '../services/tileCacheService';
 import { LogExportService } from '../services/logExportService';
 import { AIErrorCorrectionService } from '../services/AIErrorCorrectionService';
 import { RoadGraphCacheService } from '../services/roadGraphCacheService';
+import { RealTimeMapMatcher } from '../services/RealTimeMapMatcher';
 import { haversineDistance } from '../services/ekf/OutputStabilizer';
 import { backendService, type BackendConnectionStatus } from '../services/BackendService';
 import { fusionRuntime } from '../services/ekf';
@@ -197,10 +198,31 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   // EKF Fusion Runtime Lifecycle
   useEffect(() => {
     fusionRuntime.setOnFusedDataCallback((state) => {
-      setFusedState(state);
-      if (state.velocity) {
-        const speedKmH = Math.sqrt(
+      // Real-time map snapping during IDR mode
+      let snappedState = state;
+      if (
+        state.sourceMode === 'IDR' &&
+        state.latitude !== null &&
+        state.longitude !== null &&
+        state.velocity &&
+        RealTimeMapMatcher.isReady
+      ) {
+        const speedMps = Math.sqrt(
           state.velocity.x * state.velocity.x + state.velocity.y * state.velocity.y
+        );
+        const headingRad = (state.heading * Math.PI) / 180;
+        const snap = RealTimeMapMatcher.snap(
+          state.latitude, state.longitude, headingRad, speedMps
+        );
+        if (snap.confidence > 0.4 && snap.segmentId !== null) {
+          snappedState = { ...state, latitude: snap.lat, longitude: snap.lon };
+        }
+      }
+
+      setFusedState(snappedState);
+      if (snappedState.velocity) {
+        const speedKmH = Math.sqrt(
+          snappedState.velocity.x * snappedState.velocity.x + snappedState.velocity.y * snappedState.velocity.y
         ) * 3.6;
         // Clean stationary deadband: below 0.3 km/h (~0.08 m/s) is snapped to exactly 0.0 km/h
         const cleanSpeed = speedKmH < 0.3 ? 0 : Math.round(speedKmH * 10) / 10;
@@ -434,6 +456,22 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         now
       );
 
+      // AI correction loop: fire worker inference async and inject result into EKF.
+      // Only active when buffer is full (20 samples) — avoids stale/zero corrections.
+      if (AIErrorCorrectionService.isBufferReady()) {
+        const latestState = fusionRuntime.getLatestState();
+        if (latestState?.velocity) {
+          AIErrorCorrectionService.correct({
+            velX: latestState.velocity.x,
+            velY: latestState.velocity.y,
+          }).then((result) => {
+            if (result) {
+              fusionRuntime.setExternalAiCorrection(result.errVelX, result.errVelY, result.confidence);
+            }
+          });
+        }
+      }
+
 
       eventTimestampsRef.current.push(now);
       const oneSecAgo = now - 1000;
@@ -603,6 +641,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
             accuracy: pos.accuracy,
             speed: pos.speed !== null ? (pos.speed * 1000) / 3600 : null,
             heading: pos.bearing,
+            hdop: pos.hdop,
+            satellites: pos.satellites,
             timestamp: pos.timestamp || Date.now(),
           });
         }
@@ -1114,6 +1154,23 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const startTrackingSession = useCallback(() => {
     const sessionId = `session-${Date.now()}`;
     const startTime = Date.now();
+
+    const startLat = routeState.startCoords ? routeState.startCoords[0] : (currentLocation.latitude ?? undefined);
+    const startLon = routeState.startCoords ? routeState.startCoords[1] : (currentLocation.longitude ?? undefined);
+    fusionRuntime.reset(startLat, startLon);
+    fusionRuntime.getEkf().getAiModel().clearCorrection();
+    AIErrorCorrectionService.resetBuffer();
+
+    // Pre-load road segments for real-time map snapping (~1 km bounding box around start)
+    if (startLat !== undefined && startLon !== undefined && navigator.onLine) {
+      const PAD = 0.009; // ~1 km in degrees
+      RealTimeMapMatcher.loadFromOverpass(
+        startLat - PAD, startLon - PAD,
+        startLat + PAD, startLon + PAD
+      );
+    }
+    setFusedState(null);
+
     setTrackingSession({
       isActive: true,
       sessionId,

@@ -24,6 +24,8 @@ export interface CurrentLocationData {
   altitude: number | null; // meters
   speed: number | null; // km/h
   bearing: number | null; // degrees 0-360
+  hdop?: number | null;
+  satellites?: number | null;
   timestamp: number | null;
   address: string;
   source: LocationSource;

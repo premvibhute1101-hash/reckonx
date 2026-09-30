@@ -28,21 +28,40 @@ import {
 import { MobileShell } from '../components/MobileShell';
 import { MobileTestGuideModal } from '../components/MobileTestGuideModal';
 import { haversineDistance } from '../services/ekf/OutputStabilizer';
-import { DeadReckoningEngine } from '../services/deadReckoningEngine';
 import { OrientationService } from '../services/OrientationService';
-import { AIErrorCorrectionService } from '../services/AIErrorCorrectionService';
 import { formatKmDistance } from '../utils/distanceFormatter';
 import { calculateRemainingRoadDistance } from '../utils/routeProgress';
 import type { OperationalMatrixScenario } from '../types/navigation';
 
 export const getGnssStatusBadge = (
-  fused: { sourceMode: string; gnssState: string } | null | undefined,
+  fused: { sourceMode: string; gnssState: string; gnssRejected?: boolean } | null | undefined,
   isGnssActive: boolean
 ) => {
-  const sourceMode = fused ? fused.sourceMode : (isGnssActive ? 'GNSS' : 'IDR');
-  const gnssState = fused ? fused.gnssState : (isGnssActive ? 'GOOD' : 'WEAK_LOST');
+  if (!fused) {
+    if (isGnssActive) {
+      return {
+        label: 'GNSS · Raw',
+        dotColor: 'bg-emerald-500',
+        badgeBg: 'bg-emerald-50/95 text-emerald-800 border-emerald-300',
+        bottomBadgeBg: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        title: 'GNSS Active · Raw GPS Fix (<10m)',
+      };
+    } else {
+      return {
+        label: 'GNSS · Searching',
+        dotColor: 'bg-slate-400 animate-pulse',
+        badgeBg: 'bg-slate-100 text-slate-700 border-slate-300',
+        bottomBadgeBg: 'bg-slate-100 text-slate-600 border-slate-200',
+        title: 'Acquiring GNSS Signal...',
+      };
+    }
+  }
 
-  if (sourceMode === 'GNSS' && gnssState === 'GOOD') {
+  const sourceMode = fused.sourceMode;
+  const gnssState = fused.gnssState;
+  const isRejected = !!fused.gnssRejected;
+
+  if (sourceMode === 'GNSS' && !isRejected && gnssState === 'GOOD') {
     return {
       label: 'GNSS · Good',
       dotColor: 'bg-emerald-500',
@@ -50,7 +69,7 @@ export const getGnssStatusBadge = (
       bottomBadgeBg: 'bg-emerald-50 text-emerald-700 border-emerald-200',
       title: 'GNSS Active · High Precision Fix (<10m)',
     };
-  } else if (sourceMode === 'GNSS' && gnssState === 'DEGRADED') {
+  } else if (sourceMode === 'GNSS' && !isRejected && gnssState === 'DEGRADED') {
     return {
       label: 'GNSS · Degraded',
       dotColor: 'bg-amber-500',
@@ -64,7 +83,7 @@ export const getGnssStatusBadge = (
       dotColor: 'bg-rose-500 animate-pulse',
       badgeBg: 'bg-rose-50/95 text-rose-800 border-rose-300',
       bottomBadgeBg: 'bg-rose-50 text-rose-700 border-rose-200',
-      title: 'Dead Reckoning Active · GNSS Signal Lost / Weak',
+      title: 'Dead Reckoning Active · GNSS Signal Lost / Rejected',
     };
   }
 };
@@ -73,7 +92,6 @@ const LiveMetricsOverlay: React.FC<{
   remainingKm: number;
   drDrift: number;
   isGnssActive: boolean;
-  liveHeading: number;
   cameraMode: 'north-up' | 'head-up';
   onToggleCameraMode: () => void;
   onEndNavigation: () => void;
@@ -81,17 +99,14 @@ const LiveMetricsOverlay: React.FC<{
   remainingKm,
   drDrift,
   isGnssActive,
-  liveHeading,
   cameraMode,
   onToggleCameraMode,
   onEndNavigation,
 }) => {
-    const { settings, telemetry, sensorStatus, isOnline, matrixScenario, cachedTilesCount, aiCorrectionStatus, backendConnectionStatus, fusedState, currentLocation } = useNavigationContext();
+    const { settings, telemetry, isOnline, matrixScenario, cachedTilesCount, aiCorrectionStatus, backendConnectionStatus, fusedState, currentLocation } = useNavigationContext();
     const [showExitModal, setShowExitModal] = useState(false);
     const [showMobileGuide, setShowMobileGuide] = useState(false);
 
-    const isHeadingValid = isGnssActive || sensorStatus.compass || liveHeading > 0;
-    const formattedHeading = OrientationService.formatCardinalHeading(liveHeading, isHeadingValid);
     const gnssBadge = getGnssStatusBadge(fusedState, isGnssActive);
 
     const scenarioBadges: Record<
@@ -206,25 +221,25 @@ const LiveMetricsOverlay: React.FC<{
             {/* 15-State EKF Fusion & GNSS Quality Badge */}
             <div
               className={`text-[10px] font-bold px-2 py-0.5 rounded flex items-center gap-1 font-mono border ${
-                (fusedState?.sourceMode === 'IDR' || (!isGnssActive))
+                fusedState?.sourceMode === 'IDR'
                   ? 'bg-purple-700 text-white border-purple-800'
                   : fusedState?.gnssState === 'DEGRADED'
                   ? 'bg-amber-600 text-white border-amber-700'
-                  : 'bg-emerald-700 text-white border-emerald-800'
+                  : fusedState?.sourceMode === 'GNSS'
+                  ? 'bg-emerald-700 text-white border-emerald-800'
+                  : 'bg-slate-700 text-slate-300 border-slate-800'
               }`}
               title={
                 fusedState
                   ? `15-State EKF Fusion | Source: ${fusedState.sourceMode} | GNSS Quality: ${fusedState.gnssState} | Attitude: ${fusedState.isAligned ? 'Aligned ✓' : 'Aligning...'}`
-                  : `15-State EKF Engine Active`
+                  : `15-State EKF Engine Initializing`
               }
             >
               <Activity className="w-3 h-3" />
               <span>
                 {fusedState
                   ? `EKF: ${fusedState.sourceMode} [${fusedState.gnssState}]`
-                  : isGnssActive
-                  ? 'EKF: GNSS [GOOD]'
-                  : 'EKF: IDR [ACTIVE]'}
+                  : 'EKF: INIT'}
               </span>
             </div>
 
@@ -266,10 +281,10 @@ const LiveMetricsOverlay: React.FC<{
         {/* Bottom Docked HUD Panel */}
         <div className="absolute bottom-0 left-0 right-0 z-30 bg-white border-t border-slate-200 p-3 space-y-2.5 shadow-lg">
           <div className="flex items-center justify-between gap-2">
-            {/* Speedometer & Heading Readout */}
+            {/* Speedometer & GNSS Readout */}
             <div className="flex flex-col">
               <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">
-                Speed & Heading
+                Speed
               </span>
               <div className="flex items-baseline gap-1.5">
                 <span className="text-xl font-bold font-mono text-slate-900 leading-tight">
@@ -277,9 +292,6 @@ const LiveMetricsOverlay: React.FC<{
                   <span className="text-xs font-normal text-slate-500 font-sans">
                     {settings.speedUnit || 'km/h'}
                   </span>
-                </span>
-                <span className="text-xs font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-mono">
-                  {formattedHeading}
                 </span>
                 <span
                   className={`text-[10px] font-bold px-1.5 py-0.5 rounded border font-mono flex items-center gap-1 ${gnssBadge.bottomBadgeBg}`}
@@ -384,7 +396,6 @@ export const NavigationHudPage: React.FC = () => {
     showToast,
     recordSessionPoint,
     stopTrackingSession,
-    setAiCorrectionStatus,
     fusedState,
   } = useNavigationContext();
 
@@ -435,7 +446,7 @@ export const NavigationHudPage: React.FC = () => {
       setCurrentVehiclePos(newPos);
       setLiveHeading(fusedState.heading);
 
-      const isIDR = fusedState.sourceMode === 'IDR';
+      const isIDR = fusedState.sourceMode === 'IDR' || fusedState.gnssRejected;
       setIsGnssLocked(!isIDR);
 
       if (isIDR) {
@@ -486,6 +497,8 @@ export const NavigationHudPage: React.FC = () => {
           rawCbHeading: currentLocation.bearing,
           rawCbTimestamp: currentLocation.timestamp,
           gnssAppliedThisTick: fusedState.gnssAppliedThisTick,
+          gpsGroundTruthLat: currentLocation.latitude !== null && currentLocation.latitude !== undefined ? currentLocation.latitude : undefined,
+          gpsGroundTruthLng: currentLocation.longitude !== null && currentLocation.longitude !== undefined ? currentLocation.longitude : undefined,
         });
       }
 
@@ -566,12 +579,9 @@ export const NavigationHudPage: React.FC = () => {
     }
   }, [realSensors.headingDeg, realSensors.gz]);
 
-  // 2. Shortest-Path Angular Fusion & 10 Hz Ticker
-  // Keep refs for 10 Hz ticker to prevent constant effect teardown/recreation
+  // 2. Fallback Angular Fusion & 10 Hz Ticker (only active when 15-state EKF fusedState is initializing)
   const telemetryRef = useRef(telemetry);
   const isGnssLockedRef = useRef(isGnssLocked);
-  const routeStateRef = useRef(routeState);
-  const recordSessionPointRef = useRef(recordSessionPoint);
   const fusedStateRef = useRef(fusedState);
 
   useEffect(() => {
@@ -586,24 +596,18 @@ export const NavigationHudPage: React.FC = () => {
     isGnssLockedRef.current = isGnssLocked;
   }, [isGnssLocked]);
 
-  useEffect(() => {
-    routeStateRef.current = routeState;
-  }, [routeState]);
-
-  useEffect(() => {
-    recordSessionPointRef.current = recordSessionPoint;
-  }, [recordSessionPoint]);
-
-  // 2. Shortest-Path Angular Fusion & 10 Hz Ticker
+  // 2. Shortest-Path Angular Fusion & 10 Hz Ticker (runs only as fallback if fusedState is inactive)
   useEffect(() => {
     const dt = 0.1; // 100 ms = 10 Hz ticker
     const intervalId = setInterval(async () => {
+      // If 15-state EKF is active, EKF is the authoritative heading source; do not override
+      if (fusedStateRef.current) return;
+
       const prevHeading = fusedHeadingRef.current;
       const prevPos = prevVehiclePosRef.current;
       const currPos = currentVehiclePosRef.current;
       const currTelemetry = telemetryRef.current;
       const currGnssLocked = isGnssLockedRef.current;
-      const currRouteState = routeStateRef.current;
 
       let trajBearing: number | null = null;
       if (prevPos && currPos) {
@@ -627,104 +631,6 @@ export const NavigationHudPage: React.FC = () => {
       fusedHeadingRef.current = fused;
       setLiveHeading(fused);
       prevVehiclePosRef.current = currPos;
-
-      // If GNSS has been lost for > 3 seconds and EKF is not active, engage fallback Dead Reckoning kinematic stepping
-      const timeSinceLastGnss = Date.now() - lastGnssFixTimeRef.current;
-      if (!fusedStateRef.current && timeSinceLastGnss > 3000 && currPos) {
-        setIsGnssLocked(false);
-
-        // Execute Dead Reckoning kinematic step with actual sensor linear acceleration
-        const accelMag = Math.sqrt(
-          currTelemetry.ax * currTelemetry.ax +
-          currTelemetry.ay * currTelemetry.ay
-        );
-
-        const drStep = DeadReckoningEngine.stepKinematics(
-          currPos,
-          currTelemetry.speed || 0,
-          accelMag,
-          fused,
-          dt,
-          accumulatedDriftRef.current
-        );
-
-        accumulatedDriftRef.current = drStep.driftErrorMeters;
-        setDrDrift(drStep.driftErrorMeters);
-        setCurrentVehiclePos(drStep.position);
-        setDeadReckoningPath((prev) => [...prev.slice(-100), drStep.position]);
-
-        // --- AI Error Correction layer (runs AFTER raw DR step) ---
-        // Raw INS velocity from DR step (in 2D horizontal ENU plane)
-        const rawInsVelX = (drStep.velocitySpeedKmH * 1000 / 3600) * Math.sin((fused * Math.PI) / 180);
-        const rawInsVelY = (drStep.velocitySpeedKmH * 1000 / 3600) * Math.cos((fused * Math.PI) / 180);
-
-        let aiCorrectedVelX: number | null = null;
-        let aiCorrectedVelY: number | null = null;
-        let aiConfidence: number | null = null;
-        let newAiStatus: 'active' | 'fallback' | 'unavailable' = 'fallback';
-
-        if (AIErrorCorrectionService.getStatus() === 'ready' && AIErrorCorrectionService.isBufferReady()) {
-          try {
-            const aiResult = await AIErrorCorrectionService.correct({
-              velX: rawInsVelX,
-              velY: rawInsVelY,
-            });
-            if (aiResult !== null) {
-              aiCorrectedVelX = aiResult.correctedVelX;
-              aiCorrectedVelY = aiResult.correctedVelY;
-              aiConfidence = aiResult.confidence;
-              newAiStatus = 'active';
-            } else {
-              newAiStatus = 'fallback';
-            }
-          } catch {
-            newAiStatus = 'fallback';
-          }
-        } else if (AIErrorCorrectionService.getStatus() === 'unavailable') {
-          newAiStatus = 'unavailable';
-        }
-
-        // Update AI correction status in context
-        setAiCorrectionStatus(newAiStatus);
-
-        // Record DR point to session at 1 Hz — includes raw DR + AI-corrected columns
-        const nowMs = Date.now();
-        if (nowMs - lastRecordedPointTimeRef.current >= 950) {
-          lastRecordedPointTimeRef.current = nowMs;
-          recordSessionPointRef.current({
-            timestamp: nowMs,
-            lat: drStep.position[0],
-            lng: drStep.position[1],
-            accuracyMeters: (currentLocation.accuracy !== null && currentLocation.accuracy !== undefined) ? currentLocation.accuracy : undefined,
-            speedKmH: drStep.velocitySpeedKmH,
-            headingDeg: fused,
-            isDeadReckoning: true,
-            rawInsVelX,
-            rawInsVelY,
-            aiCorrectedVelX,
-            aiCorrectedVelY,
-            aiConfidence,
-            rawCbLatitude: currentLocation.latitude,
-            rawCbLongitude: currentLocation.longitude,
-            rawCbAccuracy: currentLocation.accuracy,
-            rawCbSpeedMps: currentLocation.speed !== null && currentLocation.speed !== undefined ? currentLocation.speed / 3.6 : null,
-            rawCbHeading: currentLocation.bearing,
-            rawCbTimestamp: currentLocation.timestamp,
-            gnssAppliedThisTick: false,
-          });
-        }
-
-        if (currRouteState.routeCoordinates && currRouteState.routeCoordinates.length > 0) {
-          const { remainingDistanceKm } = calculateRemainingRoadDistance(
-            drStep.position,
-            currRouteState.routeCoordinates
-          );
-          setRemainingKm(remainingDistanceKm);
-        } else if (currRouteState.destCoords) {
-          const dist = haversineDistance(drStep.position[0], drStep.position[1], currRouteState.destCoords[0], currRouteState.destCoords[1]) / 1000.0;
-          setRemainingKm(Math.round(dist * 10) / 10);
-        }
-      }
     }, 100);
 
     return () => clearInterval(intervalId);
@@ -771,11 +677,6 @@ export const NavigationHudPage: React.FC = () => {
           </p>
         </div>
       </div>
-      <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
-        <span className="text-[11px] font-extrabold px-2 py-1 rounded bg-slate-900 text-white font-mono shadow-xs">
-          {OrientationService.formatCardinalHeading(liveHeading, isGnssLocked || sensorStatus.compass || liveHeading > 0)}
-        </span>
-      </div>
     </div>
   );
 
@@ -821,7 +722,7 @@ export const NavigationHudPage: React.FC = () => {
             {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
           </button>
 
-          {/* Compass / Camera Mode Switcher (North-Up vs Head-Up) */}
+          {/* Camera Mode Switcher (North-Up vs Head-Up) */}
           <button
             onClick={() => setCameraMode((prev) => (prev === 'north-up' ? 'head-up' : 'north-up'))}
             className={`w-9 h-9 bg-white border border-slate-200 rounded-md flex items-center justify-center transition-colors shadow-xs cursor-pointer ${cameraMode === 'head-up' ? 'text-blue-700 bg-blue-50 border-blue-300' : 'text-slate-600'
@@ -882,7 +783,6 @@ export const NavigationHudPage: React.FC = () => {
           remainingKm={remainingKm}
           drDrift={drDrift}
           isGnssActive={isGnssLocked}
-          liveHeading={liveHeading}
           cameraMode={cameraMode}
           onToggleCameraMode={() =>
             setCameraMode((prev) => (prev === 'north-up' ? 'head-up' : 'north-up'))

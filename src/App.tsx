@@ -18,7 +18,7 @@ export const App: React.FC = () => {
   return (
     <NavigationProvider>
       <Router>
-        <div className="min-h-screen bg-[#F8FAFC] text-[#0F172A] selection:bg-blue-100 selection:text-blue-900">
+        <div className="min-h-app-screen bg-[#F8FAFC] text-[#0F172A] selection:bg-blue-100 selection:text-blue-900">
           <Routes>
             <Route path="/" element={<SplashPage />} />
             <Route path="/login" element={<LoginPage />} />

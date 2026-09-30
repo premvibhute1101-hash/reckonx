@@ -1,5 +1,8 @@
 import type { RecordedGPSPoint } from './api/trackingService';
 import { MapMatchingService } from './MapMatchingService';
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
+import { Capacitor } from '@capacitor/core';
 
 export interface TelemetryLogEntry {
   timestamp: number;
@@ -31,7 +34,8 @@ async function processMapMatching(points: RecordedGPSPoint[]): Promise<RecordedG
   const spans: { start: number; end: number }[] = [];
 
   for (let i = 0; i < n; i++) {
-    if (processedPoints[i].isDeadReckoning) {
+    const isDr = processedPoints[i].isDeadReckoning || processedPoints[i].gnssRejected;
+    if (isDr) {
       if (spanStart === null) spanStart = i;
     } else {
       if (spanStart !== null) {
@@ -80,7 +84,127 @@ async function processMapMatching(points: RecordedGPSPoint[]): Promise<RecordedG
   return processedPoints;
 }
 
+export function buildTelemetryCsv(
+  finalPoints: RecordedGPSPoint[],
+  sessionMetadata?: {
+    origin?: string;
+    destination?: string;
+    startTime?: number;
+    endTime?: number;
+    totalDistanceKm?: number;
+  }
+): string {
+  const rows: string[] = [];
+
+  // Optional session metadata header comments
+  if (sessionMetadata) {
+    if (sessionMetadata.origin) rows.push(`# Origin: ${sessionMetadata.origin}`);
+    if (sessionMetadata.destination) rows.push(`# Destination: ${sessionMetadata.destination}`);
+    if (sessionMetadata.totalDistanceKm) rows.push(`# Distance: ${sessionMetadata.totalDistanceKm} km`);
+    if (sessionMetadata.startTime) rows.push(`# Session Start: ${new Date(sessionMetadata.startTime).toISOString()}`);
+  }
+
+  // CSV Header row — Matched_Latitude and Matched_Longitude strictly appended at the end
+  const headers = [
+    'Timestamp_Epoch_Ms',
+    'Time_ISO',
+    'Source_Type',
+    'Latitude',
+    'Longitude',
+    'Accuracy_Meters',
+    'Speed_KmH',
+    'Heading_Deg',
+    'Altitude_Meters',
+    'Is_Dead_Reckoning',
+    // IMU & Motion Corroboration Diagnostics
+    'IMU_VarA',
+    'IMU_VarG',
+    'GNSS_Speed_Raw_KmH',
+    'GNSS_Accuracy_Raw',
+    'ZUPT_State',
+    'Gnss_Rejected',
+    'GNSS_Uncorroborated',
+    // Raw Geolocation Provider Callback Diagnostics
+    'Raw_CB_Latitude',
+    'Raw_CB_Longitude',
+    'Raw_CB_Accuracy',
+    'Raw_CB_Speed_mps',
+    'Raw_CB_Heading',
+    'Raw_CB_Timestamp',
+    'GNSS_Applied_This_Tick',
+    // AI Correction columns — populated during DR epochs
+    'Raw_DR_VelX_ms',      // Raw INS velocity X (m/s ENU) before AI correction
+    'Raw_DR_VelY_ms',      // Raw INS velocity Y (m/s ENU) before AI correction
+    'AI_Corrected_VelX_ms', // AI-corrected velocity X (m/s ENU), blank on fallback
+    'AI_Corrected_VelY_ms', // AI-corrected velocity Y (m/s ENU), blank on fallback
+    'AI_Confidence',        // Confidence proxy [0..1], blank on fallback
+    // GPS ground truth columns (actual raw GPS callback coordinates)
+    'GPS_GroundTruth_Lat',
+    'GPS_GroundTruth_Lng',
+    // Offline HMM map-matching columns (populated during DR epochs on match success)
+    'Matched_Latitude',
+    'Matched_Longitude',
+  ];
+
+  rows.push(headers.join(','));
+
+  for (const pt of finalPoints) {
+    const isActualDR = pt.isDeadReckoning || pt.gnssRejected;
+    const gtLat = pt.gpsGroundTruthLat !== undefined ? pt.gpsGroundTruthLat : (pt.rawCbLatitude !== undefined ? pt.rawCbLatitude : undefined);
+    const gtLng = pt.gpsGroundTruthLng !== undefined ? pt.gpsGroundTruthLng : (pt.rawCbLongitude !== undefined ? pt.rawCbLongitude : undefined);
+
+    const row = [
+      pt.timestamp,
+      new Date(pt.timestamp).toISOString(),
+      isActualDR ? 'DEAD_RECKONING' : 'GNSS',
+      pt.lat !== undefined ? pt.lat.toFixed(6) : '',
+      pt.lng !== undefined ? pt.lng.toFixed(6) : '',
+      pt.accuracyMeters !== undefined && pt.accuracyMeters !== null && !isNaN(pt.accuracyMeters) ? pt.accuracyMeters.toFixed(1) : '',
+      pt.speedKmH !== undefined ? pt.speedKmH.toFixed(1) : '',
+      pt.headingDeg !== undefined ? pt.headingDeg.toFixed(1) : '',
+      pt.altitudeMeters !== undefined && pt.altitudeMeters !== null ? pt.altitudeMeters.toFixed(1) : '',
+      isActualDR ? 'TRUE' : 'FALSE',
+      // IMU & Motion Corroboration Diagnostics
+      pt.imuVarA !== undefined && pt.imuVarA !== null && !isNaN(pt.imuVarA) ? pt.imuVarA.toFixed(6) : '',
+      pt.imuVarG !== undefined && pt.imuVarG !== null && !isNaN(pt.imuVarG) ? pt.imuVarG.toFixed(6) : '',
+      pt.gnssSpeedRawKmH !== undefined && pt.gnssSpeedRawKmH !== null && !isNaN(pt.gnssSpeedRawKmH) ? pt.gnssSpeedRawKmH.toFixed(2) : '',
+      pt.gnssAccuracyRaw !== undefined && pt.gnssAccuracyRaw !== null && !isNaN(pt.gnssAccuracyRaw) ? pt.gnssAccuracyRaw.toFixed(1) : '',
+      pt.zuptState || ((pt.speedKmH || 0) > 0.5 ? 'RELEASED' : 'LOCKED'),
+      pt.gnssRejected ? 'TRUE' : 'FALSE',
+      pt.gnssUncorroborated ? 'TRUE' : 'FALSE',
+      // Raw Geolocation Provider Callback Diagnostics
+      pt.rawCbLatitude !== undefined && pt.rawCbLatitude !== null ? pt.rawCbLatitude.toFixed(6) : '',
+      pt.rawCbLongitude !== undefined && pt.rawCbLongitude !== null ? pt.rawCbLongitude.toFixed(6) : '',
+      pt.rawCbAccuracy !== undefined && pt.rawCbAccuracy !== null ? pt.rawCbAccuracy.toFixed(1) : '',
+      pt.rawCbSpeedMps !== undefined && pt.rawCbSpeedMps !== null ? pt.rawCbSpeedMps.toFixed(2) : '',
+      pt.rawCbHeading !== undefined && pt.rawCbHeading !== null ? pt.rawCbHeading.toFixed(1) : '',
+      pt.rawCbTimestamp !== undefined && pt.rawCbTimestamp !== null ? pt.rawCbTimestamp : '',
+      pt.gnssAppliedThisTick ? 'TRUE' : 'FALSE',
+      // AI correction columns
+      pt.rawInsVelX !== undefined ? pt.rawInsVelX.toFixed(4) : '',
+      pt.rawInsVelY !== undefined ? pt.rawInsVelY.toFixed(4) : '',
+      pt.aiCorrectedVelX != null ? pt.aiCorrectedVelX.toFixed(4) : '',
+      pt.aiCorrectedVelY != null ? pt.aiCorrectedVelY.toFixed(4) : '',
+      pt.aiConfidence != null ? pt.aiConfidence.toFixed(4) : '',
+      // GPS ground truth (raw unfiltered GPS callback coordinates)
+      gtLat !== undefined && gtLat !== null ? gtLat.toFixed(6) : '',
+      gtLng !== undefined && gtLng !== null ? gtLng.toFixed(6) : '',
+      // Matched coordinates (blank on failure or non-DR)
+      pt.matchedLat !== undefined && pt.matchedLat !== null ? pt.matchedLat.toFixed(6) : '',
+      pt.matchedLng !== undefined && pt.matchedLng !== null ? pt.matchedLng.toFixed(6) : '',
+    ];
+    rows.push(row.join(','));
+  }
+
+  return rows.join('\r\n');
+}
+
 export const LogExportService = {
+  /**
+   * Generates formatted CSV string from recorded GPS points.
+   */
+  generateTelemetryCsv: buildTelemetryCsv,
+
   /**
    * Post-processes DR spans with offline HMM map matching and triggers download
    * of a genuine CSV file from real collected telemetry & tracking data.
@@ -104,126 +228,60 @@ export const LogExportService = {
 
     // Run offline HMM map-matching on DR spans
     const finalPoints = await processMapMatching(points);
-
-    const rows: string[] = [];
-
-    // Optional session metadata header comments
-    if (sessionMetadata) {
-      if (sessionMetadata.origin) rows.push(`# Origin: ${sessionMetadata.origin}`);
-      if (sessionMetadata.destination) rows.push(`# Destination: ${sessionMetadata.destination}`);
-      if (sessionMetadata.totalDistanceKm) rows.push(`# Distance: ${sessionMetadata.totalDistanceKm} km`);
-      if (sessionMetadata.startTime) rows.push(`# Session Start: ${new Date(sessionMetadata.startTime).toISOString()}`);
-    }
-
-    // CSV Header row — Matched_Latitude and Matched_Longitude strictly appended at the end
-    const headers = [
-      'Timestamp_Epoch_Ms',
-      'Time_ISO',
-      'Source_Type',
-      'Latitude',
-      'Longitude',
-      'Accuracy_Meters',
-      'Speed_KmH',
-      'Heading_Deg',
-      'Altitude_Meters',
-      'Is_Dead_Reckoning',
-      // IMU & Motion Corroboration Diagnostics
-      'IMU_VarA',
-      'IMU_VarG',
-      'GNSS_Speed_Raw_KmH',
-      'GNSS_Accuracy_Raw',
-      'ZUPT_State',
-      'Gnss_Rejected',
-      'GNSS_Uncorroborated',
-      // Raw Geolocation Provider Callback Diagnostics
-      'Raw_CB_Latitude',
-      'Raw_CB_Longitude',
-      'Raw_CB_Accuracy',
-      'Raw_CB_Speed_mps',
-      'Raw_CB_Heading',
-      'Raw_CB_Timestamp',
-      'GNSS_Applied_This_Tick',
-      // AI Correction columns — populated during DR epochs
-      'Raw_DR_VelX_ms',      // Raw INS velocity X (m/s ENU) before AI correction
-      'Raw_DR_VelY_ms',      // Raw INS velocity Y (m/s ENU) before AI correction
-      'AI_Corrected_VelX_ms', // AI-corrected velocity X (m/s ENU), blank on fallback
-      'AI_Corrected_VelY_ms', // AI-corrected velocity Y (m/s ENU), blank on fallback
-      'AI_Confidence',        // Confidence proxy [0..1], blank on fallback
-      // GPS ground truth columns (same as lat/lng for GNSS points)
-      'GPS_GroundTruth_Lat',
-      'GPS_GroundTruth_Lng',
-      // Offline HMM map-matching columns (populated during DR epochs on match success)
-      'Matched_Latitude',
-      'Matched_Longitude',
-    ];
-
-    rows.push(headers.join(','));
-
-    for (const pt of finalPoints) {
-      const row = [
-        pt.timestamp,
-        new Date(pt.timestamp).toISOString(),
-        pt.isDeadReckoning ? 'DEAD_RECKONING' : 'GNSS',
-        pt.lat !== undefined ? pt.lat.toFixed(6) : '',
-        pt.lng !== undefined ? pt.lng.toFixed(6) : '',
-        pt.accuracyMeters !== undefined && pt.accuracyMeters !== null && !isNaN(pt.accuracyMeters) ? pt.accuracyMeters.toFixed(1) : '',
-        pt.speedKmH !== undefined ? pt.speedKmH.toFixed(1) : '',
-        pt.headingDeg !== undefined ? pt.headingDeg.toFixed(1) : '',
-        pt.altitudeMeters !== undefined && pt.altitudeMeters !== null ? pt.altitudeMeters.toFixed(1) : '',
-        pt.isDeadReckoning ? 'TRUE' : 'FALSE',
-        // IMU & Motion Corroboration Diagnostics
-        pt.imuVarA !== undefined && pt.imuVarA !== null && !isNaN(pt.imuVarA) ? pt.imuVarA.toFixed(6) : '',
-        pt.imuVarG !== undefined && pt.imuVarG !== null && !isNaN(pt.imuVarG) ? pt.imuVarG.toFixed(6) : '',
-        pt.gnssSpeedRawKmH !== undefined && pt.gnssSpeedRawKmH !== null && !isNaN(pt.gnssSpeedRawKmH) ? pt.gnssSpeedRawKmH.toFixed(2) : '',
-        pt.gnssAccuracyRaw !== undefined && pt.gnssAccuracyRaw !== null && !isNaN(pt.gnssAccuracyRaw) ? pt.gnssAccuracyRaw.toFixed(1) : '',
-        pt.zuptState || ((pt.speedKmH || 0) > 0.5 ? 'RELEASED' : 'LOCKED'),
-        pt.gnssRejected ? 'TRUE' : 'FALSE',
-        pt.gnssUncorroborated ? 'TRUE' : 'FALSE',
-        // Raw Geolocation Provider Callback Diagnostics
-        pt.rawCbLatitude !== undefined && pt.rawCbLatitude !== null ? pt.rawCbLatitude.toFixed(6) : '',
-        pt.rawCbLongitude !== undefined && pt.rawCbLongitude !== null ? pt.rawCbLongitude.toFixed(6) : '',
-        pt.rawCbAccuracy !== undefined && pt.rawCbAccuracy !== null ? pt.rawCbAccuracy.toFixed(1) : '',
-        pt.rawCbSpeedMps !== undefined && pt.rawCbSpeedMps !== null ? pt.rawCbSpeedMps.toFixed(2) : '',
-        pt.rawCbHeading !== undefined && pt.rawCbHeading !== null ? pt.rawCbHeading.toFixed(1) : '',
-        pt.rawCbTimestamp !== undefined && pt.rawCbTimestamp !== null ? pt.rawCbTimestamp : '',
-        pt.gnssAppliedThisTick ? 'TRUE' : 'FALSE',
-        // AI correction columns
-        pt.rawInsVelX !== undefined ? pt.rawInsVelX.toFixed(4) : '',
-        pt.rawInsVelY !== undefined ? pt.rawInsVelY.toFixed(4) : '',
-        pt.aiCorrectedVelX != null ? pt.aiCorrectedVelX.toFixed(4) : '',
-        pt.aiCorrectedVelY != null ? pt.aiCorrectedVelY.toFixed(4) : '',
-        pt.aiConfidence != null ? pt.aiConfidence.toFixed(4) : '',
-        // GPS ground truth (for GNSS points, mirrors lat/lng; for DR points, blank)
-        pt.gpsGroundTruthLat !== undefined ? pt.gpsGroundTruthLat.toFixed(6) : (!pt.isDeadReckoning && pt.lat !== undefined ? pt.lat.toFixed(6) : ''),
-        pt.gpsGroundTruthLng !== undefined ? pt.gpsGroundTruthLng.toFixed(6) : (!pt.isDeadReckoning && pt.lng !== undefined ? pt.lng.toFixed(6) : ''),
-        // Matched coordinates (blank on failure or non-DR)
-        pt.matchedLat !== undefined && pt.matchedLat !== null ? pt.matchedLat.toFixed(6) : '',
-        pt.matchedLng !== undefined && pt.matchedLng !== null ? pt.matchedLng.toFixed(6) : '',
-      ];
-      rows.push(row.join(','));
-    }
-
-    const csvContent = rows.join('\r\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-
+    const csvContent = buildTelemetryCsv(finalPoints, sessionMetadata);
     const timestampStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const filename = `reckonx_telemetry_log_${timestampStr}.csv`;
 
-    link.setAttribute('href', url);
-    link.setAttribute('download', filename);
-    link.style.visibility = 'hidden';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    try {
+      if (Capacitor.isNativePlatform()) {
+        // Native Android / iOS storage write via Capacitor Filesystem
+        const result = await Filesystem.writeFile({
+          path: filename,
+          data: csvContent,
+          directory: Directory.Cache,
+          encoding: Encoding.UTF8,
+        });
 
-    return {
-      success: true,
-      message: `Exported ${finalPoints.length} genuine telemetry points to ${filename}`,
-      filename,
-    };
+        // Trigger native OS share sheet (Save to Files / Share via apps)
+        await Share.share({
+          title: 'Export ReckonX Telemetry',
+          text: 'ReckonX Sensor & EKF Telemetry Log',
+          url: result.uri,
+          dialogTitle: 'Save or Share CSV Log',
+        });
+
+        return {
+          success: true,
+          message: `Exported ${finalPoints.length} telemetry points to ${filename} ✓`,
+          filename,
+        };
+      } else {
+        // Web Browser Fallback: Blob + <a> download
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+
+        link.setAttribute('href', url);
+        link.setAttribute('download', filename);
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        return {
+          success: true,
+          message: `Exported ${finalPoints.length} genuine telemetry points to ${filename} ✓`,
+          filename,
+        };
+      }
+    } catch (err: any) {
+      console.error('[LogExportService] CSV Export failed:', err);
+      return {
+        success: false,
+        message: `Failed to export CSV: ${err?.message || 'Permission denied or storage error.'}`,
+      };
+    }
   },
 
   /**

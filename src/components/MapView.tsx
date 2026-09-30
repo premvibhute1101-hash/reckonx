@@ -232,6 +232,8 @@ const MapViewComponent: React.FC<MapViewProps> = ({
   const visualPosRef = useRef<[number, number] | null>(validLivePos || validStartPos);
   const targetHeadingRef = useRef<number>(liveHeading || 0);
   const visualHeadingRef = useRef<number>(liveHeading || 0);
+  const cameraHeadingRef = useRef<number>(liveHeading || 0);
+  const lastPannedPosRef = useRef<[number, number] | null>(null);
   const cameraModeRef = useRef<'north-up' | 'head-up'>(cameraMode);
 
   // Follow Mode State (OFF by default in explore/route-setup; ON in navigation)
@@ -377,7 +379,7 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     };
   }, [onMapClick]);
 
-  // 60 FPS Visual Interpolation Loop for Vehicle Marker & Optional Camera Follow
+  // 60 FPS Visual Interpolation Loop for Vehicle Marker & Smooth Vibration-Free Camera Follow
   useEffect(() => {
     let animId: number;
     let lastTime = performance.now();
@@ -396,17 +398,34 @@ const MapViewComponent: React.FC<MapViewProps> = ({
           visualPosRef.current = [targetPos[0], targetPos[1]];
         } else {
           // Smooth exponential LERP factor for position
-          const factor = Math.min(1, dt * 10);
+          const factor = Math.min(1, dt * 8);
           visualPosRef.current[0] += (targetPos[0] - visualPosRef.current[0]) * factor;
           visualPosRef.current[1] += (targetPos[1] - visualPosRef.current[1]) * factor;
         }
 
-        // Shortest-path angular heading LERP
-        const diff = ((targetHeading - visualHeadingRef.current + 540) % 360) - 180;
-        visualHeadingRef.current += diff * Math.min(1, dt * 12);
+        // Shortest-path angular heading LERP for vehicle arrow with deadband filter
+        const diffHeading = ((targetHeading - visualHeadingRef.current + 540) % 360) - 180;
+        if (Math.abs(diffHeading) > 0.20) {
+          visualHeadingRef.current += diffHeading * Math.min(1, dt * 8);
+        }
 
         const vPos: [number, number] = [visualPosRef.current[0], visualPosRef.current[1]];
         const vHead = visualHeadingRef.current;
+
+        // Smooth camera rotation with angular deadband to completely eliminate micro-jitter vibration
+        if (cameraModeRef.current === 'head-up') {
+          const diffCam = ((vHead - cameraHeadingRef.current + 540) % 360) - 180;
+          if (Math.abs(diffCam) > 0.8) {
+            cameraHeadingRef.current += diffCam * Math.min(1, dt * 3.5);
+          }
+        } else {
+          const diffCam = ((0 - cameraHeadingRef.current + 540) % 360) - 180;
+          if (Math.abs(diffCam) > 0.2) {
+            cameraHeadingRef.current += diffCam * Math.min(1, dt * 5.0);
+          } else {
+            cameraHeadingRef.current = 0;
+          }
+        }
 
         // Update vehicle marker imperatively (DOES NOT MOVE CAMERA)
         if (isValidCoordinate(vPos)) {
@@ -425,20 +444,29 @@ const MapViewComponent: React.FC<MapViewProps> = ({
             vehicleMarkerRef.current = newMarker;
           }
 
-          // ONLY glide camera if Follow Mode is explicitly ON (e.g. active navigation)
+          // ONLY pan camera if Follow Mode is explicitly ON and vehicle has moved significantly
           if (
             followModeRef.current &&
             map &&
             !isProgrammaticMoveRef.current
           ) {
-            map.panTo(vPos, { animate: false });
+            const lastPanned = lastPannedPosRef.current;
+            const distChanged = lastPanned
+              ? Math.hypot(vPos[0] - lastPanned[0], vPos[1] - lastPanned[1])
+              : 1;
+            // Only re-pan if position changed by > ~0.05m (5e-7 degrees) to avoid subpixel DOM jitter
+            if (distChanged > 5e-7) {
+              lastPannedPosRef.current = [vPos[0], vPos[1]];
+              map.panTo(vPos, { animate: false });
+            }
           }
         }
 
-        // Head-Up Camera Rotation if enabled
+        // Apply smooth, vibration-free Head-Up camera rotation (1:1 scale, no marker magnification)
         if (mapContainerRef.current) {
-          if (cameraModeRef.current === 'head-up') {
-            mapContainerRef.current.style.transform = `rotate(${-vHead}deg)`;
+          const camRot = cameraHeadingRef.current;
+          if (cameraModeRef.current === 'head-up' || Math.abs(camRot) > 0.2) {
+            mapContainerRef.current.style.transform = `rotate(${-camRot}deg)`;
           } else {
             mapContainerRef.current.style.transform = 'rotate(0deg)';
           }
@@ -686,6 +714,7 @@ const MapViewComponent: React.FC<MapViewProps> = ({
         }`}
         style={{
           transformOrigin: 'center center',
+          willChange: 'transform',
         }}
       />
 

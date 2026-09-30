@@ -3,6 +3,9 @@ import { InsMechanization } from './InsMechanization';
 import { OutputStabilizer } from './OutputStabilizer';
 import type { StabilizerInput } from './OutputStabilizer';
 import type { GnssState } from './GnssQualityStateMachine';
+import { MotionClassifier, type MotionActivity } from './MotionClassifier';
+import { AnomalyDetector, type AnomalyReport } from './AnomalyDetector';
+import { EARTH_RADIUS_METERS } from '../../constants/geodesy';
 
 export interface FusedState {
   latitude: number | null;
@@ -18,6 +21,9 @@ export interface FusedState {
   accelBias: { x: number; y: number; z: number };
   gyroBias: { x: number; y: number; z: number };
   isAligned: boolean;
+  // Activity & Anomaly Telemetry
+  motionActivity?: MotionActivity;
+  anomalyReport?: AnomalyReport;
   // IMU & Motion Corroboration Diagnostic Telemetry
   imuVarA?: number;
   imuVarG?: number;
@@ -47,6 +53,8 @@ export interface GnssSample {
   accuracy?: number | null;
   speed?: number | null;
   heading?: number | null;
+  hdop?: number | null;
+  satellites?: number | null;
   timestamp?: number;
 }
 
@@ -54,6 +62,9 @@ export class FusionRuntime {
   private ekf: EkfCore;
   private pureIns: InsMechanization;
   private outputStabilizer: OutputStabilizer;
+  private motionClassifier: MotionClassifier;
+  private anomalyDetector: AnomalyDetector;
+  private lastAnomalyReport: AnomalyReport | undefined = undefined;
   public isRunning = false;
 
   private imuWindow: number[][] = [];
@@ -80,10 +91,18 @@ export class FusionRuntime {
   private isGnssUncorroborated = false;
   private gnssAppliedThisTick = false;
 
-  // IDR Rest Floor Rule (Configurable: default varA < 0.01, varG < 0.001)
-  private readonly REST_VAR_A_THRESHOLD = 0.01;
-  private readonly REST_VAR_G_THRESHOLD = 0.001;
+  // IDR Rest Floor Rule & Stationary Variance Gates (varA < 0.025, varG < 0.01)
+  private readonly REST_VAR_A_THRESHOLD = 0.025;
+  private readonly REST_VAR_G_THRESHOLD = 0.01;
   private consecutiveRestFloorTicks = 0;
+  private consecutiveGnssZeroTicks = 0;
+
+  // Initial Rest Calibration (2 seconds / up to 200 samples)
+  private isCalibrated = false;
+  private calibrationSamples: { accel: { x: number; y: number; z: number }; gyro: { x: number; y: number; z: number } }[] = [];
+  private calibrationStartTime = 0;
+  private staticBiasA = { x: 0, y: 0, z: 0 };
+  private staticBiasG = { x: 0, y: 0, z: 0 };
 
   // 1.5s Low-pass filtered horizontal acceleration for motion corroboration (rejects idle vibration)
   private horizAccelWindow: [number, number][] = [];
@@ -102,8 +121,8 @@ export class FusionRuntime {
   private lastGnssAccuracyRaw: number | null = null;
   private lastGnssRejected: boolean = false;
 
-  // Earth radius in meters
-  private readonly R_EARTH = 6378137;
+  // Consolidated Earth radius in meters (WGS-84)
+  private readonly R_EARTH = EARTH_RADIUS_METERS;
 
   // Callback to update subscribers
   private onFusedDataCallback: ((state: FusedState) => void) | null = null;
@@ -119,6 +138,8 @@ export class FusionRuntime {
     this.ekf = new EkfCore();
     this.pureIns = new InsMechanization();
     this.outputStabilizer = new OutputStabilizer({ maxSpeedMps: 33.3, maxAccelMps2: 9.8 });
+    this.motionClassifier = new MotionClassifier();
+    this.anomalyDetector = new AnomalyDetector();
     // Pre-fill IMU window with gravity baseline
     for (let i = 0; i < 20; i++) {
       this.imuWindow.push([0, 0, 9.81, 0, 0, 0]);
@@ -135,6 +156,15 @@ export class FusionRuntime {
 
   public getEkf(): EkfCore {
     return this.ekf;
+  }
+
+  /**
+   * Injects an AI velocity error correction from aiCorrection.worker.ts into the
+   * EKF's AiMotionModel. Called asynchronously from NavigationContext after each
+   * AIErrorCorrectionService.correct() resolves.
+   */
+  public setExternalAiCorrection(errVelX: number, errVelY: number, confidence: number): void {
+    this.ekf.getAiModel().setExternalCorrection(errVelX, errVelY, confidence);
   }
 
   public isImuMotionCorroborated(): boolean {
@@ -162,6 +192,9 @@ export class FusionRuntime {
     this.ekf = new EkfCore();
     this.pureIns = new InsMechanization();
     this.outputStabilizer = new OutputStabilizer({ maxSpeedMps: 33.3, maxAccelMps2: 9.8 });
+    this.motionClassifier = new MotionClassifier();
+    this.anomalyDetector = new AnomalyDetector();
+    this.lastAnomalyReport = undefined;
     this.imuWindow = [];
     for (let i = 0; i < 20; i++) {
       this.imuWindow.push([0, 0, 9.81, 0, 0, 0]);
@@ -185,6 +218,12 @@ export class FusionRuntime {
     this.isGnssUncorroborated = false;
     this.gnssAppliedThisTick = false;
     this.consecutiveRestFloorTicks = 0;
+    this.consecutiveGnssZeroTicks = 0;
+    this.isCalibrated = false;
+    this.calibrationSamples = [];
+    this.calibrationStartTime = 0;
+    this.staticBiasA = { x: 0, y: 0, z: 0 };
+    this.staticBiasG = { x: 0, y: 0, z: 0 };
     this.horizAccelWindow = [];
     this.lastLpHorizAccel = 0;
     this.imuIntegratedSpeedDuringWindow = 0;
@@ -205,6 +244,10 @@ export class FusionRuntime {
       this.initialLon = null;
     }
     this.latestFusedState = null;
+  }
+
+  public isLastGnssRejected(): boolean {
+    return this.lastGnssRejected;
   }
 
   public updateGnss(gnss: GnssSample) {
@@ -273,6 +316,15 @@ export class FusionRuntime {
     this.lastGnssSpeedRawKmH = (gnss.speed !== null && gnss.speed !== undefined && !isNaN(gnss.speed)) ? gnss.speed * 3.6 : 0;
     this.lastGnssAccuracyRaw = effAccuracy;
 
+    // Track consecutive GNSS zero-speed updates for fallback ZUPT triggering
+    if (gnss.speed !== null && gnss.speed !== undefined && !isNaN(gnss.speed)) {
+      if (gnss.speed < 0.1) {
+        this.consecutiveGnssZeroTicks++;
+      } else if (gnss.speed >= 0.3) {
+        this.consecutiveGnssZeroTicks = 0;
+      }
+    }
+
     // Track trusted GNSS speed for stationary cross-checking
     if (gnss.speed !== null && gnss.speed !== undefined && !isNaN(gnss.speed) && gnss.speed >= 0) {
       this.lastKnownGnssSpeed = gnss.speed;
@@ -330,13 +382,29 @@ export class FusionRuntime {
       this.nonStationaryCount = this.ZUPT_RELEASE_HYSTERESIS + 1;
     }
 
-    this.ekf.updateGnss(gnssPos, gnssVel, effAccuracy, this.imuWindow, isImuCorroborated, isEscapeActive);
+    const gnssDist = this.lastKnownGnssSpeed !== null ? this.lastKnownGnssSpeed * (timeGapMs / 1000.0) : 0;
+    const gnssAnomaly = this.anomalyDetector.checkGnssSample(
+      gnssDist,
+      timeGapMs / 1000.0,
+      isImuCorroborated,
+      Math.sqrt(dx * dx + dy * dy)
+    );
+    if (gnssAnomaly.severity !== 'NONE') {
+      this.lastAnomalyReport = gnssAnomaly;
+    }
+
+    this.ekf.updateGnss(
+      gnssPos,
+      gnssVel,
+      effAccuracy,
+      this.imuWindow,
+      isImuCorroborated,
+      isEscapeActive,
+      gnss.hdop,
+      gnss.satellites
+    );
     this.lastGnssRejected = this.ekf.isLastGnssRejected();
     this.gnssAppliedThisTick = !this.lastGnssRejected;
-
-    const qualityState = this.ekf.getGnssState().getState();
-    const action = qualityState === 'WEAK_LOST' ? 'DR_FALLBACK' : qualityState === 'DEGRADED' ? 'APPLIED_DOWNWEIGHTED' : 'APPLIED_FULL';
-    console.log(`[GNSS Ingest] gap=${timeGapMs}ms, ts=${this.lastGnssTimestamp}, lat=${gnss.latitude.toFixed(6)}, lng=${gnss.longitude.toFixed(6)}, acc=${effAccuracy.toFixed(1)}m, quality=${qualityState}, action=${action}, rejected=${this.lastGnssRejected}`);
 
     this.emitFusedState();
   }
@@ -357,10 +425,79 @@ export class FusionRuntime {
     this.lastImuTimestamp = now;
     this.gnssAppliedThisTick = false;
 
+    // Requirement 4: Initial Rest Calibration Phase (2 seconds / up to 200 samples)
+    if (!this.isCalibrated) {
+      if (this.calibrationStartTime === 0) {
+        this.calibrationStartTime = now;
+      }
+      this.calibrationSamples.push({ accel: { ...accel }, gyro: { ...gyro } });
+
+      const elapsedMs = now - this.calibrationStartTime;
+      const count = this.calibrationSamples.length;
+      const isMovingStartup = (this.lastKnownGnssSpeed !== null && this.lastKnownGnssSpeed > 1.0) ||
+                              (Math.sqrt(accel.x * accel.x + accel.y * accel.y) > 2.0);
+
+      if (count >= 200 || (elapsedMs >= 2000 && count >= 20) || (isMovingStartup && count >= 5)) {
+        let sumAx = 0, sumAy = 0, sumAz = 0;
+        let sumGx = 0, sumGy = 0, sumGz = 0;
+        for (const s of this.calibrationSamples) {
+          sumAx += s.accel.x; sumAy += s.accel.y; sumAz += s.accel.z;
+          sumGx += s.gyro.x; sumGy += s.gyro.y; sumGz += s.gyro.z;
+        }
+        const meanAx = sumAx / count;
+        const meanAy = sumAy / count;
+        const meanAz = sumAz / count;
+        const meanGx = sumGx / count;
+        const meanGy = sumGy / count;
+        const meanGz = sumGz / count;
+
+        const meanMag = Math.sqrt(meanAx * meanAx + meanAy * meanAy + meanAz * meanAz);
+        if (meanMag <= 3.0 && !isMovingStartup) {
+          // Pure linear acceleration: average is exact zero bias
+          this.staticBiasA = { x: meanAx, y: meanAy, z: meanAz };
+        } else {
+          this.staticBiasA = { x: 0, y: 0, z: 0 };
+        }
+        if (!isMovingStartup) {
+          this.staticBiasG = { x: meanGx, y: meanGy, z: meanGz };
+        }
+
+        if (!this.isAttitudeInitialized) {
+          const initAccel = { x: meanAx, y: meanAy, z: meanAz };
+          this.ekf.getIns().initializeAttitude(initAccel);
+          this.pureIns.initializeAttitude(initAccel);
+          this.ekf.notifyAttitudeInitialized();
+          this.isAttitudeInitialized = true;
+        }
+        this.isCalibrated = true;
+      } else {
+        // Calibration in progress: force zero velocity and output
+        this.emitFusedState();
+        return;
+      }
+    }
+
+    // Subtract initial calibration baseline biases
+    const imuAnomaly = this.anomalyDetector.checkImuSample(accel, now);
+    if (imuAnomaly.severity !== 'NONE') {
+      this.lastAnomalyReport = imuAnomaly;
+    }
+
+    const unbiasedAccel = {
+      x: accel.x - this.staticBiasA.x,
+      y: accel.y - this.staticBiasA.y,
+      z: accel.z - this.staticBiasA.z,
+    };
+    const unbiasedGyro = {
+      x: gyro.x - this.staticBiasG.x,
+      y: gyro.y - this.staticBiasG.y,
+      z: gyro.z - this.staticBiasG.z,
+    };
+
     // Build sample vector [accelX, accelY, accelZ, gyroX, gyroY, gyroZ]
     const imuSample = [
-      accel.x, accel.y, accel.z,
-      gyro.x, gyro.y, gyro.z
+      unbiasedAccel.x, unbiasedAccel.y, unbiasedAccel.z,
+      unbiasedGyro.x, unbiasedGyro.y, unbiasedGyro.z
     ];
 
     // Rolling window (keep exactly 20 samples)
@@ -388,6 +525,7 @@ export class FusionRuntime {
 
     // ZUPT / Stationary Detection
     let isStationary = false;
+    let isAtRestFloorLevel = false;
     let varA = 0;
     let varG = 0;
     if (this.imuWindow.length >= 20) {
@@ -416,8 +554,8 @@ export class FusionRuntime {
       // vibration creates filter ripple up to ~0.18 m/s^2, so corroboration requires true acceleration >= 0.22 m/s^2.
       const isIdleVibrating = varA >= 0.15 || varG >= 0.035;
       const corroborationThreshold = isIdleVibrating ? 0.22 : 0.06;
-      const isImuMotionEvident = lpHorizAccel >= corroborationThreshold;
-      const isImuCompletelyStill = lpHorizAccel < 0.04 && varA < 0.05 && varG < 0.02;
+      const isImuMotionEvident = isIdleVibrating ? (lpHorizAccel >= corroborationThreshold) : (lpHorizAccel >= corroborationThreshold || varA >= 0.035);
+      const isImuCompletelyStill = lpHorizAccel < 0.05 && varA < 0.025 && varG < 0.02;
 
       if (isImuMotionEvident) {
         this.imuMotionCorroborationCount = Math.min(20, this.imuMotionCorroborationCount + 1);
@@ -427,8 +565,11 @@ export class FusionRuntime {
         this.imuIntegratedSpeedDuringWindow = Math.max(0, this.imuIntegratedSpeedDuringWindow - 0.5 * dt);
       }
 
-      // IDR Rest-Floor Counter (Item 2a: varA < 0.01, varG < 0.001)
-      const isAtRestFloorLevel = varA < this.REST_VAR_A_THRESHOLD && varG < this.REST_VAR_G_THRESHOLD;
+      // IDR Rest-Floor Counter (no horizontal acceleration AND low variance)
+      isAtRestFloorLevel = lpHorizAccel < 0.05 && (
+        (varA < this.REST_VAR_A_THRESHOLD && varG < this.REST_VAR_G_THRESHOLD) ||
+        (varA < 0.05 && varG < 0.025)
+      );
       if (isAtRestFloorLevel) {
         this.consecutiveRestFloorTicks++;
       } else {
@@ -436,12 +577,16 @@ export class FusionRuntime {
       }
 
       // Stationary Detection: true physical stillness or vehicle idling
-      const isImuStationary = varA < 0.15 && varG < 0.035;
+      const isImuStationary = ((varA < this.REST_VAR_A_THRESHOLD && varG < this.REST_VAR_G_THRESHOLD) ||
+                               (varA < 0.15 && varG < 0.035)) && lpHorizAccel < 0.05;
 
       const gnssQuality = this.ekf.getGnssState().getState();
       const isGnssFresh = (now - this.lastKnownGnssSpeedTimestamp) < 2500 && (gnssQuality === 'GOOD' || gnssQuality === 'DEGRADED');
 
-      // Hysteresis with debounce for GNSS speed bands (Item 2d: enter moving at >= 1.5 km/h, exit at < 1.0 km/h)
+      // Fallback check: If GNSS speed is 0.0 for > 2 seconds and variance is relatively stable (varA < 0.25, varG < 0.05)
+      const isGnssZeroSpeedFallback = this.consecutiveGnssZeroTicks >= 2 && varA < 0.25 && varG < 0.05;
+
+      // Hysteresis with debounce for GNSS speed bands (enter moving >= 1.5 km/h, exit < 1.0 km/h)
       if (isGnssFresh && this.lastKnownGnssSpeed !== null) {
         const gnssSpeedKmh = this.lastKnownGnssSpeed * 3.6;
         if (gnssSpeedKmh >= 1.5) {
@@ -468,33 +613,44 @@ export class FusionRuntime {
 
       const allowMotionRelease = this.isImuMotionCorroborated() || (this.sustainedUncorroboratedGnssCount >= this.SUSTAINED_GNSS_ESCAPE_THRESHOLD);
 
+      // Physical launch hysteresis threshold: a_horiz >= 0.5 m/s^2 and varG < 0.05
+      const isPhysicalLaunch = lpHorizAccel >= 0.5 && varG < 0.05;
+
       if (this.wasZuptActiveLastCycle) {
-        // IMU-Corroboration Gate:
-        // When locked in ZUPT:
-        // Do NOT release ZUPT unless GNSS indicates motion (speed >= 0.15 m/s or moving band)
-        // AND the motion is corroborated by IMU (or sustained escape)
+        // Strict ZUPT lock: hold until physical launch threshold or corroborated GNSS motion
         const isGnssIndicatingMotion = this.isGnssMovingBand || (isGnssFresh && this.lastKnownGnssSpeed !== null && this.lastKnownGnssSpeed >= 0.15);
-        if (isGnssIndicatingMotion && allowMotionRelease) {
+        if ((isGnssIndicatingMotion && allowMotionRelease) || isPhysicalLaunch) {
           isStationary = false;
+          if (isPhysicalLaunch) {
+            this.imuMotionCorroborationCount = Math.max(this.imuMotionCorroborationCount, this.IMU_MOTION_CORROBORATION_THRESHOLD);
+            this.nonStationaryCount = this.ZUPT_RELEASE_HYSTERESIS + 1;
+            this.wasZuptActiveLastCycle = false;
+            this.ekf.notifyZuptReleased();
+          }
         } else {
           isStationary = true;
         }
       } else {
-        // When vehicle is in active motion:
-        if (isGnssFresh && this.lastKnownGnssSpeed !== null) {
+        // Active motion evaluation:
+        if (isPhysicalLaunch) {
+          this.imuMotionCorroborationCount = Math.max(this.imuMotionCorroborationCount, this.IMU_MOTION_CORROBORATION_THRESHOLD);
+          isStationary = false;
+        } else if (isGnssZeroSpeedFallback) {
+          isStationary = true;
+          this.imuMotionCorroborationCount = 0;
+          this.imuIntegratedSpeedDuringWindow = 0;
+        } else if (isGnssFresh && this.lastKnownGnssSpeed !== null) {
           const gnssSpeedKmh = this.lastKnownGnssSpeed * 3.6;
           if (this.isGnssMovingBand || gnssSpeedKmh >= 1.5) {
             isStationary = false;
-          } else if (gnssSpeedKmh >= 0.35 && (lpHorizAccel >= 0.06 || this.isImuMotionCorroborated())) {
-            // Low-speed creep band (0.35..1.0 km/h) with IMU motion evidence
+          } else if ((gnssSpeedKmh >= 0.20 || this.isImuMotionCorroborated()) && (lpHorizAccel >= 0.05 || this.isImuMotionCorroborated() || varA >= 0.035)) {
+            // Low-speed creep band with IMU motion evidence
             isStationary = false;
-          } else if (gnssSpeedKmh < 1.0 && this.gnssStationaryDebounceCount >= this.GNSS_DEBOUNCE_THRESHOLD) {
-            // Speed dropped to ~0 (< 1.0 km/h) and debounced: vehicle stopped at red light / parked
+          } else if (gnssSpeedKmh < 1.0 && this.gnssStationaryDebounceCount >= this.GNSS_DEBOUNCE_THRESHOLD && !this.isImuMotionCorroborated()) {
             isStationary = true;
             this.imuMotionCorroborationCount = 0;
             this.imuIntegratedSpeedDuringWindow = 0;
           } else {
-            // In hysteresis deadband [1.0, 1.5 km/h) or awaiting stationary debounce: hold moving
             isStationary = false;
           }
         } else {
@@ -502,24 +658,26 @@ export class FusionRuntime {
           const currentInsVel = this.ekf.getIns().velocity;
           const currentInsSpeed = Math.sqrt(currentInsVel.x * currentInsVel.x + currentInsVel.y * currentInsVel.y);
 
-          // IDR Rest-Floor Rule (Item 2a):
-          // If IMU variance stays at measured rest floor (varA < 0.01, varG < 0.001) for >= 5s (50 ticks)
-          // apply ZUPT even if INS speed > 5 m/s!
-          if (this.consecutiveRestFloorTicks >= 50) {
-            isStationary = true;
-            this.ekf.getIns().velocity = { x: 0, y: 0, z: 0 };
-            this.pureIns.velocity = { x: 0, y: 0, z: 0 };
-          } else if (this.consecutiveRestFloorTicks >= 10 && currentInsSpeed > 0.5) {
-            // Active velocity decay during rest floor onset
-            const dampFactor = Math.max(0, 1 - 0.5 * dt);
-            this.ekf.getIns().velocity.x *= dampFactor;
-            this.ekf.getIns().velocity.y *= dampFactor;
-            this.ekf.getIns().velocity.z *= dampFactor;
-            isStationary = false;
-          } else if (currentInsSpeed > 0.5) {
-            isStationary = false;
+          if (currentInsSpeed <= 0.5) {
+            // Low speed / at rest: engage ZUPT immediately when IMU is stationary
+            isStationary = isImuStationary || isAtRestFloorLevel;
           } else {
-            isStationary = isImuStationary;
+            // High speed motion (e.g. tunnel outage): maintain velocity during outage,
+            // but if device is physically resting (low variance), stop after 1.5s debounce.
+            const isCompletelyResting = isAtRestFloorLevel || (lpHorizAccel < 0.08 && varA < 0.04 && varG < 0.015);
+            if (isCompletelyResting) {
+              this.consecutiveRestFloorTicks++;
+            } else {
+              this.consecutiveRestFloorTicks = 0;
+            }
+
+            if (this.consecutiveRestFloorTicks >= 15) {
+              isStationary = true;
+              this.ekf.getIns().velocity = { x: 0, y: 0, z: 0 };
+              this.pureIns.velocity = { x: 0, y: 0, z: 0 };
+            } else {
+              isStationary = false;
+            }
           }
         }
       }
@@ -542,30 +700,41 @@ export class FusionRuntime {
     const posBefore = { ...this.ekf.getPosition() };
     const purePosBefore = { ...this.pureIns.position };
 
-    // EKF Predict
-    this.ekf.predict(dt, [imuSample[0], imuSample[1], imuSample[2]], [imuSample[3], imuSample[4], imuSample[5]]);
-
-    // Pure INS Predict
+    // Pure INS Predict (tracks true un-clamped specific force for launch corroboration)
     this.pureIns.predict(
       dt, 
-      { x: imuSample[0], y: imuSample[1], z: imuSample[2] }, 
-      { x: imuSample[3], y: imuSample[4], z: imuSample[5] }
+      { x: unbiasedAccel.x, y: unbiasedAccel.y, z: unbiasedAccel.z }, 
+      { x: unbiasedGyro.x, y: unbiasedGyro.y, z: unbiasedGyro.z }
     );
 
-    if (this.imuWindow.length >= 20) {
-      if (isStationary) {
-        this.ekf.updateZupt();
-        this.wasZuptActiveLastCycle = true;
-        this.nonStationaryCount = 0;
+    // Requirement 3: Hard State Overrides during ZUPT
+    if (isStationary) {
+      // Force input linear acceleration to [0, 0, 0] for EKF propagation to prevent velocity integration
+      const isSpecificForce = Math.sqrt(unbiasedAccel.x * unbiasedAccel.x + unbiasedAccel.y * unbiasedAccel.y + unbiasedAccel.z * unbiasedAccel.z) > 3.0;
+      const zeroAccel = [0, 0, isSpecificForce ? 9.81 : 0];
 
-        // Hard-freeze position to completely eliminate stationary drift
-        this.ekf.getPosition().x = posBefore.x;
-        this.ekf.getPosition().y = posBefore.y;
-        this.ekf.getPosition().z = posBefore.z;
-        this.pureIns.position.x = purePosBefore.x;
-        this.pureIns.position.y = purePosBefore.y;
-        this.pureIns.position.z = purePosBefore.z;
-      } else {
+      this.ekf.predict(dt, zeroAccel, [0, 0, 0]);
+
+      // Overwrite velocity state vector to exactly [0, 0, 0]
+      this.ekf.getIns().velocity = { x: 0, y: 0, z: 0 };
+      this.pureIns.velocity = { x: 0, y: 0, z: 0 };
+
+      this.ekf.updateZupt();
+      this.wasZuptActiveLastCycle = true;
+      this.nonStationaryCount = 0;
+
+      // Hard-freeze position to completely eliminate stationary drift
+      this.ekf.getPosition().x = posBefore.x;
+      this.ekf.getPosition().y = posBefore.y;
+      this.ekf.getPosition().z = posBefore.z;
+      this.pureIns.position.x = purePosBefore.x;
+      this.pureIns.position.y = purePosBefore.y;
+      this.pureIns.position.z = purePosBefore.z;
+    } else {
+      // Normal EKF Predict
+      this.ekf.predict(dt, [imuSample[0], imuSample[1], imuSample[2]], [imuSample[3], imuSample[4], imuSample[5]]);
+
+      if (this.imuWindow.length >= 20) {
         this.nonStationaryCount++;
         if (this.nonStationaryCount <= this.ZUPT_RELEASE_HYSTERESIS) {
           this.ekf.updateZupt();
@@ -581,14 +750,21 @@ export class FusionRuntime {
             this.wasZuptActiveLastCycle = false;
           }
 
-          // Gentle velocity damping ONLY during quasi-stationary periods (e.g. handheld tilt at rest)
+          // Gentle velocity damping during quasi-stationary periods
           const gnssQuality = this.ekf.getGnssState().getState();
           const isGnssFresh = (now - this.lastKnownGnssSpeedTimestamp) < 2500 && (gnssQuality === 'GOOD' || gnssQuality === 'DEGRADED');
           const isMovingWithGnss = isGnssFresh && this.lastKnownGnssSpeed !== null && (this.lastKnownGnssSpeed * 3.6 >= 1.5);
           const currentInsVel = this.ekf.getIns().velocity;
           const currentInsSpeed = Math.sqrt(currentInsVel.x * currentInsVel.x + currentInsVel.y * currentInsVel.y);
-          if (!isMovingWithGnss && currentInsSpeed < 0.8 && varA < 0.25 && varG < 0.06) {
+          if (!isMovingWithGnss && !this.isImuMotionCorroborated() && this.lastLpHorizAccel < 0.06 && currentInsSpeed < 0.8 && varA < 0.25 && varG < 0.06) {
             const dampFactor = Math.max(0, 1 - 0.5 * dt);
+            this.ekf.getIns().velocity.x *= dampFactor;
+            this.ekf.getIns().velocity.y *= dampFactor;
+            this.ekf.getIns().velocity.z *= dampFactor;
+          } else if (!isGnssFresh && isAtRestFloorLevel) {
+            // Smooth decay during sustained IDR rest floor
+            const decayRate = currentInsSpeed > 2.0 ? 1.5 : 0.6;
+            const dampFactor = Math.max(0, 1 - decayRate * dt);
             this.ekf.getIns().velocity.x *= dampFactor;
             this.ekf.getIns().velocity.y *= dampFactor;
             this.ekf.getIns().velocity.z *= dampFactor;
@@ -633,7 +809,8 @@ export class FusionRuntime {
     const state = this.ekf.getGnssState().getState();
     const now = this.lastImuTimestamp > 0 ? this.lastImuTimestamp : (this.lastGnssTimestamp > 0 ? this.lastGnssTimestamp : Date.now());
     const isGnssFresh = (now - this.lastGnssTimestamp) < 6000;
-    const sourceMode: 'GNSS' | 'IDR' = (isGnssFresh && (state === 'GOOD' || state === 'DEGRADED')) ? 'GNSS' : 'IDR';
+    const isGnssUsable = isGnssFresh && !this.lastGnssRejected && (state === 'GOOD' || state === 'DEGRADED');
+    const sourceMode: 'GNSS' | 'IDR' = isGnssUsable ? 'GNSS' : 'IDR';
 
     // Compass heading (clockwise 0°..360° from North)
     let headingDeg = (-att.yaw * (180 / Math.PI)) % 360;
@@ -661,7 +838,17 @@ export class FusionRuntime {
     const biases = this.ekf.getBiases();
 
     const speedMag = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
-    const cleanVel = (this.wasZuptActiveLastCycle || speedMag < 0.03) ? { x: 0, y: 0, z: 0 } : { x: vel.x, y: vel.y, z: vel.z };
+    const isZuptActive = this.wasZuptActiveLastCycle || speedMag < 0.05 || !this.isCalibrated;
+    const cleanVel = isZuptActive ? { x: 0, y: 0, z: 0 } : { x: vel.x, y: vel.y, z: vel.z };
+    const cleanGnssSpeedKmH = isZuptActive ? 0.0 : this.lastGnssSpeedRawKmH;
+    const effectiveSpeedKmh = Math.sqrt(cleanVel.x * cleanVel.x + cleanVel.y * cleanVel.y) * 3.6;
+
+    const motionResult = this.motionClassifier.classify({
+      varA: this.lastImuVarA,
+      varG: this.lastImuVarG,
+      lpHorizAccel: this.lastLpHorizAccel,
+      speedKmh: effectiveSpeedKmh,
+    });
 
     const fusedState: FusedState = {
       latitude: fusedLat,
@@ -676,10 +863,12 @@ export class FusionRuntime {
       pureInsLongitude: pureInsLon,
       accelBias: biases.accel,
       gyroBias: biases.gyro,
-      isAligned: this.isAttitudeInitialized,
+      isAligned: this.isAttitudeInitialized && this.isCalibrated,
+      motionActivity: motionResult.activity,
+      anomalyReport: this.lastAnomalyReport,
       imuVarA: this.lastImuVarA,
       imuVarG: this.lastImuVarG,
-      gnssSpeedRawKmH: this.lastGnssSpeedRawKmH,
+      gnssSpeedRawKmH: cleanGnssSpeedKmH,
       gnssAccuracyRaw: this.lastGnssAccuracyRaw,
       zuptState: this.wasZuptActiveLastCycle ? 'LOCKED' : 'RELEASED',
       gnssRejected: this.lastGnssRejected,

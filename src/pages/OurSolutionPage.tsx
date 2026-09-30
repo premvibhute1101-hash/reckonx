@@ -109,9 +109,8 @@ export const OurSolutionPage: React.FC = () => {
 
   return (
     <MobileShell header={header} footer={<BottomNav />}>
-      <div className="h-full flex flex-col justify-between p-4 pb-20">
-        <div className="space-y-4">
-          {/* Header Card */}
+      <div className="p-4 space-y-4">
+        {/* Header Card */}
           <div className="bg-white border border-slate-200 rounded-md p-4 space-y-2">
             <div className="flex items-center gap-2">
               <span className="w-2.5 h-2.5 rounded-full bg-blue-700" />
@@ -199,7 +198,6 @@ export const OurSolutionPage: React.FC = () => {
             })}
           </div>
         </div>
-      </div>
     </MobileShell>
   );
 };

@@ -22,6 +22,22 @@
   }
 }
 
+/* Dynamic Viewport (100dvh with 100vh fallback) & Mobile Scroll */
+.h-app-screen {
+  height: 100vh;
+  height: 100dvh;
+}
+
+.min-h-app-screen {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.mobile-scroll-container {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 4px;

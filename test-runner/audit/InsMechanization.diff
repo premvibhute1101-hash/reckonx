@@ -1,0 +1,140 @@
+--- IDR_PRO/src/core/InsMechanization.ts
++++ src/services/ekf/InsMechanization.ts
+@@ -35,9 +35,11 @@
+   }
+ 
+   public initializeAttitude(accel: { x: number; y: number; z: number }) {
+-    // Initialize roll and pitch using the gravity vector to prevent massive gravity leakage into horizontal velocity
+-    this.attitude.pitch = Math.atan2(accel.y, accel.z);
+-    this.attitude.roll = Math.atan2(-accel.x, Math.sqrt(accel.y * accel.y + accel.z * accel.z));
++    // Standard gravity vector alignment:
++    // Roll (rotation around body X-axis) = atan2(ay, az)
++    // Pitch (rotation around body Y-axis) = atan2(-ax, sqrt(ay^2 + az^2))
++    this.attitude.roll = Math.atan2(accel.y, accel.z);
++    this.attitude.pitch = Math.atan2(-accel.x, Math.sqrt(accel.y * accel.y + accel.z * accel.z));
+     // Also seed the LPF history with the initial reading to prevent startup transients
+     this.accelXHist = [accel.x, accel.x];
+     this.accelYHist = [accel.y, accel.y];
+@@ -113,33 +115,59 @@
+     // 0. Low-pass filter accelerometer to attenuate heel-strike impact transients
+     const fAccel = this.filterAccel(dt, accel);
+ 
+-    // 1. Update attitude (Euler angles integration)
+-    // For a simple strapdown, we integrate gyro directly into roll/pitch/yaw.
+-    // In a real system, quaternions are better to avoid gimbal lock.
+-    this.attitude.pitch += gyro.x * dt;
+-    this.attitude.roll += gyro.y * dt;
++    // 1. Update attitude (Euler angles integration: gyro.x=roll, gyro.y=pitch, gyro.z=yaw)
++    let newRoll = this.attitude.roll + gyro.x * dt;
++    let newPitch = this.attitude.pitch + gyro.y * dt;
+     this.attitude.yaw += gyro.z * dt;
+ 
+-    // 2. Transform body frame acceleration to navigation frame (ENU)
+-    const cr = Math.cos(this.attitude.pitch);
+-    const sr = Math.sin(this.attitude.pitch);
+-    const cp = Math.cos(this.attitude.roll);
+-    const sp = Math.sin(this.attitude.roll);
+-    const cy = Math.cos(this.attitude.yaw);
+-    const sy = Math.sin(this.attitude.yaw);
+-
+-    // Rotation Matrix R_b^n (Body to Nav ENU)
+-    const R11 = cp * cy;
+-    const R12 = sr * sp * cy - cr * sy;
+-    const R13 = cr * sp * cy + sr * sy;
+-
+-    const R21 = cp * sy;
+-    const R22 = sr * sp * sy + cr * cy;
+-    const R23 = cr * sp * sy - sr * cy;
+-
+-    const R31 = -sp;
+-    const R32 = sr * cp;
+-    const R33 = cr * cp;
++    // 2. Dynamic Gravity Leveling / Continuous Tilt Correction
++    // When stationary or in quasi-steady motion without horizontal acceleration,
++    // drive estimated roll/pitch toward the accelerometer gravity vector.
++    // Suppressed when horizontal acceleration is present (e.g. vehicle accel/braking or walking strides > 0.15 m/s^2)
++    const accelMag = Math.sqrt(fAccel.x * fAccel.x + fAccel.y * fAccel.y + fAccel.z * fAccel.z);
++    const gravityDiff = Math.abs(accelMag - this.gravity);
++
++    const rollAcc = Math.atan2(fAccel.y, fAccel.z);
++    const pitchAcc = Math.atan2(-fAccel.x, Math.sqrt(fAccel.y * fAccel.y + fAccel.z * fAccel.z));
++
++    // Pitch leveling: Lateral acceleration (fAccel.x) has zero mean during forward travel,
++    // so pitch is continuously leveled against gyro integration drift
++    const alphaPitch = Math.min(0.2, 0.4 * dt);
++    newPitch = newPitch + alphaPitch * (pitchAcc - newPitch);
++
++    // Roll leveling: Forward body acceleration (fAccel.y) can be sustained during vehicle maneuvers,
++    // so roll is gated on |fAccel.y| to prevent vehicle acceleration from being interpreted as tilt
++    let alphaRoll = 0.02 * dt;
++    if (Math.abs(fAccel.y) < 0.08 && gravityDiff < 0.3) {
++      const gainWeight = Math.max(0, 1 - (Math.abs(fAccel.y) / 0.08)) * Math.max(0, 1 - (gravityDiff / 0.3));
++      alphaRoll += 0.78 * gainWeight * dt;
++    }
++    alphaRoll = Math.min(0.2, alphaRoll);
++    newRoll = newRoll + alphaRoll * (rollAcc - newRoll);
++
++    this.attitude.roll = newRoll;
++    this.attitude.pitch = newPitch;
++
++    // 3. Transform body frame acceleration to navigation frame (ENU)
++    const cRoll = Math.cos(this.attitude.roll);
++    const sRoll = Math.sin(this.attitude.roll);
++    const cPitch = Math.cos(this.attitude.pitch);
++    const sPitch = Math.sin(this.attitude.pitch);
++    const cYaw = Math.cos(this.attitude.yaw);
++    const sYaw = Math.sin(this.attitude.yaw);
++
++    // Standard Z-Y-X (Yaw-Pitch-Roll) Rotation Matrix R_b^n (Body to Nav ENU)
++    const R11 = cYaw * cPitch;
++    const R12 = cYaw * sPitch * sRoll - sYaw * cRoll;
++    const R13 = cYaw * sPitch * cRoll + sYaw * sRoll;
++
++    const R21 = sYaw * cPitch;
++    const R22 = sYaw * sPitch * sRoll + cYaw * cRoll;
++    const R23 = sYaw * sPitch * cRoll - cYaw * sRoll;
++
++    const R31 = -sPitch;
++    const R32 = cPitch * sRoll;
++    const R33 = cPitch * cRoll;
+ 
+     this.lastRotationMatrix = [
+       [R11, R12, R13],
+@@ -147,23 +175,31 @@
+       [R31, R32, R33]
+     ];
+ 
+-    const a_n_x = R11 * fAccel.x + R12 * fAccel.y + R13 * fAccel.z;
+-    const a_n_y = R21 * fAccel.x + R22 * fAccel.y + R23 * fAccel.z;
+-    const a_n_z = R31 * fAccel.x + R32 * fAccel.y + R33 * fAccel.z;
++    let a_n_x = R11 * fAccel.x + R12 * fAccel.y + R13 * fAccel.z;
++    let a_n_y = R21 * fAccel.x + R22 * fAccel.y + R23 * fAccel.z;
++    let a_n_z = R31 * fAccel.x + R32 * fAccel.y + R33 * fAccel.z;
+ 
+     this.lastSpecificForce = { x: a_n_x, y: a_n_y, z: a_n_z };
+ 
+-    // 3. Subtract gravity (assuming Z is up in ENU)
++    // 4. Subtract gravity (assuming Z is up in ENU)
+     const a_n_z_no_g = a_n_z - this.gravity;
+ 
+-    // 4. Integrate acceleration into velocity
++    // 5. Integrate acceleration into velocity
+     this.velocity.x += a_n_x * dt;
+     this.velocity.y += a_n_y * dt;
+     this.velocity.z += a_n_z_no_g * dt;
+ 
+-    // 5. Integrate velocity into position
++    // 7. Integrate velocity into position
+     this.position.x += this.velocity.x * dt;
+     this.position.y += this.velocity.y * dt;
+     this.position.z += this.velocity.z * dt;
+   }
++
++  public getLastNavAccel(): { x: number; y: number; z: number } {
++    return {
++      x: this.lastSpecificForce ? this.lastSpecificForce.x : 0,
++      y: this.lastSpecificForce ? this.lastSpecificForce.y : 0,
++      z: this.lastSpecificForce ? this.lastSpecificForce.z - this.gravity : 0,
++    };
++  }
+ }

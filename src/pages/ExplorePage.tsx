@@ -260,7 +260,10 @@ export const ExplorePage: React.FC = () => {
         </div>
 
         {/* Floating Map Control Buttons */}
-        <div className="absolute right-3 bottom-20 z-20 flex flex-col gap-2">
+        <div
+          className="absolute right-3 z-20 flex flex-col gap-2"
+          style={{ bottom: 'calc(5rem + env(safe-area-inset-bottom, 0px))' }}
+        >
           <button
             onClick={() => (window as any).__mapZoomIn?.()}
             className="w-9 h-9 bg-white border border-slate-200 rounded-md flex items-center justify-center text-slate-900 hover:bg-slate-50 shadow-xs cursor-pointer"
@@ -286,7 +289,10 @@ export const ExplorePage: React.FC = () => {
 
         {/* Dynamic Bottom Route Card */}
         {routeState.calculated && (
-          <div className="absolute bottom-16 left-0 right-0 z-20 bg-white border-t border-slate-200 p-4 shadow-lg space-y-2">
+          <div
+            className="absolute left-0 right-0 z-20 bg-white border-t border-slate-200 p-4 shadow-lg space-y-2"
+            style={{ bottom: 'calc(4rem + env(safe-area-inset-bottom, 0px))' }}
+          >
             <div className="flex items-center justify-between">
               <div className="min-w-0 pr-2">
                 <h3 className="text-xs font-bold text-slate-900 truncate">

@@ -17,6 +17,22 @@ export class EkfCore {
   private gnssState: GnssQualityStateMachine;
   private aiModel: AiMotionModel;
 
+  // ── IDR_PRO_2 feature flags ────────────────────────────────────────────────
+  /** Enable phone-to-vehicle yaw offset estimation from GNSS course vs INS heading. */
+  public enableYawAlignment: boolean = false;
+  /** Enable Non-Holonomic Constraints (lateral + vertical velocity = 0) in WEAK_LOST mode. */
+  public enableNHC: boolean = false;
+  /** Enable bump/pothole gate: inflate Q and suppress AI during high-vibration events. */
+  public enableBumpGate: boolean = false;
+  /** Running count of detected bump events (diagnostic). */
+  public bumpGateCount: number = 0;
+
+  /** Estimated yaw offset between phone forward axis and vehicle forward axis (radians). */
+  private yawOffsetRad: number = 0;
+  /** True once yawOffsetRad has been initialised from at least one moving GNSS update. */
+  private yawOffsetActive: boolean = false;
+  // ──────────────────────────────────────────────────────────────────────────
+
   constructor() {
     this.x = Matrix.zeros(15, 1);
     this.P = Matrix.zeros(15, 15);
@@ -129,23 +145,38 @@ export class EkfCore {
       }
     }
 
-    // Process noise Q (tunable placeholders - calibrate against actual IMU noise characteristics)
+    // Process noise Q (tunable — calibrate against actual IMU noise characteristics)
     const Q = Matrix.zeros(15, 15);
     for (let i = 0; i < 3; i++) Q.set(i, i, 0.1 * dt);         // position
 
-    // Velocity Q: inflate during post-ZUPT cooldown to allow graceful transition
-    // from pinned-zero covariance to motion-trusting covariance
+    // Bump / Pothole Gate: detect high-acceleration or high-rotation events
+    // and inflate velocity + attitude Q to reduce trust in IMU during vibration.
+    let bumpDetected = false;
+    if (this.enableBumpGate) {
+      const accelMag = Math.sqrt(accel[0]*accel[0] + accel[1]*accel[1] + accel[2]*accel[2]);
+      const gyroMag  = Math.sqrt(gyro[0]*gyro[0]  + gyro[1]*gyro[1]  + gyro[2]*gyro[2]);
+      if (Math.abs(accelMag - 9.81) > 3.0 || gyroMag > 1.0) {
+        bumpDetected = true;
+        this.bumpGateCount++;
+      }
+    }
+
+    // Velocity Q: inflate during post-ZUPT cooldown to allow graceful transition.
+    // Also inflate massively if a bump/pothole is detected.
     let velQ = 0.25 * dt;
     if (this.postZuptCooldown > 0) {
-      velQ = 2.0 * dt; // 2x inflation during transition (cooldown)
+      velQ = 2.0 * dt;
       this.postZuptCooldown--;
+    }
+    if (bumpDetected) {
+      velQ = Math.max(velQ, 5.0 * dt);
     }
     this.lastVelQ = velQ;
     for (let i = 3; i < 6; i++) Q.set(i, i, velQ);
 
-    for (let i = 6; i < 9; i++) Q.set(i, i, 0.000001 * dt);     // attitude (gyro noise ~1e-6)
-    for (let i = 9; i < 12; i++) Q.set(i, i, 0.00001 * dt);     // accel bias (slow drift)
-    for (let i = 12; i < 15; i++) Q.set(i, i, 0.000001 * dt);   // gyro bias (very slow drift)
+    for (let i = 6; i < 9; i++) Q.set(i, i, bumpDetected ? 0.001 * dt : 0.000001 * dt);  // attitude
+    for (let i = 9; i < 12; i++) Q.set(i, i, 0.00001 * dt);    // accel bias
+    for (let i = 12; i < 15; i++) Q.set(i, i, 0.000001 * dt);  // gyro bias
 
     this.P = F.mmul(this.P).mmul(F.transpose()).add(Q);
 
@@ -193,14 +224,24 @@ export class EkfCore {
       this.x.set(5, 0, 0);
     }
 
+    // Project Nav-frame attitude error delta_theta^n to Body frame delta_theta^b = (C_b^n)^T * delta_theta^n
+    const dThetaE = this.x.get(6, 0);
+    const dThetaN = this.x.get(7, 0);
+    const dThetaU = this.x.get(8, 0);
+    const C_b_n = this.ins.lastRotationMatrix;
+
+    const dRollRaw = C_b_n[0][0] * dThetaE + C_b_n[1][0] * dThetaN + C_b_n[2][0] * dThetaU;
+    const dPitchRaw = C_b_n[0][1] * dThetaE + C_b_n[1][1] * dThetaN + C_b_n[2][1] * dThetaU;
+    const dYawRaw = C_b_n[0][2] * dThetaE + C_b_n[1][2] * dThetaN + C_b_n[2][2] * dThetaU;
+
     // Clamp attitude error correction to max ~3 degrees (0.05 rad) per update to prevent tilt runaway
     const maxAttJump = 0.05;
-    const dPitch = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(6, 0)));
-    const dRoll = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(7, 0)));
-    const dYaw = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(8, 0)));
+    const dRoll = Math.max(-maxAttJump, Math.min(maxAttJump, dRollRaw));
+    const dPitch = Math.max(-maxAttJump, Math.min(maxAttJump, dPitchRaw));
+    const dYaw = Math.max(-maxAttJump, Math.min(maxAttJump, dYawRaw));
 
-    this.ins.attitude.pitch += dPitch;
     this.ins.attitude.roll += dRoll;
+    this.ins.attitude.pitch += dPitch;
     this.ins.attitude.yaw += dYaw;
 
     // Reset error state (since we fed it back)
@@ -267,10 +308,12 @@ export class EkfCore {
     accuracy: number | null,
     recentImuWindow: number[][] = [],
     isImuMotionCorroborated: boolean = true,
-    isUncorroboratedEscape: boolean = false
+    isUncorroboratedEscape: boolean = false,
+    hdop?: number | null,
+    satCount?: number | null
   ): boolean {
     // 1. Determine GNSS Quality
-    const rScale = this.gnssState.updateState(accuracy);
+    const rScale = this.gnssState.updateState(accuracy, hdop, satCount);
     const state = this.gnssState.getState();
 
     const gnssReportedSpeed = gnssVel !== null
@@ -341,6 +384,26 @@ export class EkfCore {
     if (state === 'GOOD' || state === 'DEGRADED') {
       this.lastGnssPos = [...gnssPos];
       this.lastGnssUpdateTime = this.currentTime;
+
+      // Yaw alignment: estimate phone-to-vehicle yaw offset from GNSS course vs INS heading.
+      // Only active when enableYawAlignment = true and vehicle is moving (speed > 3 m/s).
+      if (this.enableYawAlignment && effectiveVel !== null) {
+        const speed = Math.sqrt(effectiveVel[0]*effectiveVel[0] + effectiveVel[1]*effectiveVel[1]);
+        if (speed > 3.0) {
+          const gnssCourse = Math.atan2(effectiveVel[0], effectiveVel[1]); // atan2(E, N)
+          const C = this.ins.lastRotationMatrix;
+          const insCourse = Math.atan2(C[0][1], C[1][1]); // phone-Y in nav frame
+          let diff = gnssCourse - insCourse;
+          while (diff > Math.PI) diff -= 2 * Math.PI;
+          while (diff < -Math.PI) diff += 2 * Math.PI;
+          if (!this.yawOffsetActive) {
+            this.yawOffsetRad = diff;
+            this.yawOffsetActive = true;
+          } else {
+            this.yawOffsetRad = 0.95 * this.yawOffsetRad + 0.05 * diff; // α=0.05 LPF
+          }
+        }
+      }
     }
 
     if (state === 'GOOD' || state === 'DEGRADED') {
@@ -362,7 +425,7 @@ export class EkfCore {
 
       let R_pos = Matrix.eye(3).mul(basePosVar);
       if (state === 'DEGRADED') {
-        R_pos = R_pos.mulColumnVector(Matrix.columnVector(Array(3).fill(rScale)));
+        R_pos = R_pos.mul(rScale);
       }
 
       const z_pos = new Matrix([
@@ -373,12 +436,17 @@ export class EkfCore {
       const isUncorroboratedStationary = this.wasZuptActive && !isImuMotionCorroborated && !isUncorroboratedEscape;
       const posJump = Math.sqrt(z_pos.get(0, 0) * z_pos.get(0, 0) + z_pos.get(1, 0) * z_pos.get(1, 0));
 
+      const currentSpeed = Math.sqrt(this.ins.velocity.x * this.ins.velocity.x + this.ins.velocity.y * this.ins.velocity.y);
+      const dtGap = this.lastGnssUpdateTime > 0 ? Math.min(Math.max(this.currentTime - this.lastGnssUpdateTime, 0.1), 15.0) : 1.0;
+
       let posUpdated = false;
       if (isUncorroboratedStationary && posJump > 2.0) {
-        // While uncorroborated: reject position jumps (> 2.0m)
+        // While uncorroborated stationary: reject position jumps (> 2.0m)
         posUpdated = false;
       } else {
-        const posThreshold = this.postZuptCooldown > 0 ? 150.0 : (this.wasZuptActive ? 6.0 : 45.0);
+        // Dynamic moving threshold: expand innovation gate gracefully during fast motion and multi-second GPS gaps
+        const dynamicMovingThreshold = Math.max(120.0, 45.0 + currentSpeed * dtGap * 4.0);
+        const posThreshold = this.postZuptCooldown > 0 ? 150.0 : (this.wasZuptActive ? 6.0 : dynamicMovingThreshold);
         posUpdated = this.applyMeasurementUpdate(H_pos, z_pos, R_pos, posThreshold);
       }
 
@@ -393,7 +461,7 @@ export class EkfCore {
         const baseVelVar = isUncorroboratedEscape ? 2.5 : (gnssVel !== null ? 0.01 : 1.0);
         let R_vel = Matrix.eye(3).mul(baseVelVar);
         if (state === 'DEGRADED') {
-          R_vel = R_vel.mulColumnVector(Matrix.columnVector(Array(3).fill(rScale)));
+          R_vel = R_vel.mul(rScale);
         }
 
         const z_vel = new Matrix([
@@ -401,16 +469,11 @@ export class EkfCore {
           [effectiveVel[1] - this.ins.velocity.y],
           [effectiveVel[2] - this.ins.velocity.z],
         ]);
-        const velThreshold = this.postZuptCooldown > 0 ? 150.0 : (isUncorroboratedEscape ? 60.0 : 45.0);
+        const velThreshold = this.postZuptCooldown > 0 ? 150.0 : (isUncorroboratedEscape ? 60.0 : 60.0);
         velUpdated = this.applyMeasurementUpdate(H_vel, z_vel, R_vel, velThreshold);
       }
 
       this.lastGnssRejected = effectiveVel !== null ? (!posUpdated && !velUpdated) : !posUpdated;
-
-      if (this.isAttitudeInitialized && !this.wasZuptActive) {
-        this.applyNhc(0.05, 0.01);
-      }
-
     } else {
       // WEAK_LOST State: Use AI pseudo-measurement and NHC
       const aiCorrection = this.aiModel.predictError(
@@ -512,7 +575,7 @@ export class EkfCore {
       return;
     }
 
-    const MAX_VELOCITY_JUMP = 3.0; // m/s per cycle
+    const MAX_VELOCITY_JUMP = 5.0; // max ~18 km/h velocity change per cycle
     const dx = v.x - this.previousVelocity.x;
     const dy = v.y - this.previousVelocity.y;
     const dz = v.z - this.previousVelocity.z;
@@ -520,7 +583,7 @@ export class EkfCore {
 
     if (jumpMag > MAX_VELOCITY_JUMP) {
       console.warn(
-        `[Velocity Jump Guard] Warning: |velocity| changed by ${jumpMag.toFixed(2)} m/s in single cycle (> ${MAX_VELOCITY_JUMP} m/s).\n` +
+        `[Velocity Jump Guard] Warning: |velocity| changed by ${jumpMag.toFixed(2)} m/s in single cycle (> ${MAX_VELOCITY_JUMP} m/s). Clamping.\n` +
         `State Dump:\n` +
         `  Raw Accel: [${this.lastRawAccel.map(n => n.toFixed(3)).join(', ')}]\n` +
         `  Filtered Accel: ${JSON.stringify(this.ins.getFilteredAccel())}\n` +
@@ -529,6 +592,10 @@ export class EkfCore {
         `  AI Correction: ${JSON.stringify(this.lastAiCorrection)}\n` +
         `  Current Velocity: [${v.x.toFixed(3)}, ${v.y.toFixed(3)}, ${v.z.toFixed(3)}]`
       );
+      const scale = MAX_VELOCITY_JUMP / jumpMag;
+      v.x = this.previousVelocity.x + dx * scale;
+      v.y = this.previousVelocity.y + dy * scale;
+      v.z = this.previousVelocity.z + dz * scale;
     }
 
     // Absolute velocity clamp (runaway safety guard)
